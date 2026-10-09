@@ -17,9 +17,11 @@ constexpr socket_t INVALID_SOCK = INVALID_SOCKET;
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <cerrno>
 using socket_t = int;
 constexpr socket_t INVALID_SOCK = -1;
 #endif
