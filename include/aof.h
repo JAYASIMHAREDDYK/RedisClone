@@ -6,64 +6,62 @@
 #include <functional>
 #include <atomic>
 #include <thread>
-#include <mutex>
 #include <cstdint>
 
 namespace redis {
 
-enum class AofFsyncPolicy {
+enum class FsyncPolicy {
     Always,
     EverySec,
     No
 };
 
-class AofEngine {
+class Aof {
 public:
     using CommandCallback = std::function<void(const std::vector<std::string>&)>;
 
-    explicit AofEngine(std::string filename = "appendonly.aof", 
-                       AofFsyncPolicy policy = AofFsyncPolicy::EverySec);
-    ~AofEngine();
+    explicit Aof(std::string filename = "appendonly.aof", 
+                 FsyncPolicy policy = FsyncPolicy::EverySec);
+    ~Aof();
 
-    AofEngine(const AofEngine&) = delete;
-    AofEngine& operator=(const AofEngine&) = delete;
+    Aof(const Aof&) = delete;
+    Aof& operator=(const Aof&) = delete;
 
     bool open();
     void close();
 
-    void appendCommand(const std::vector<std::string>& args);
+    void append(const std::vector<std::string>& args);
+    bool rewrite_bg(Dict& dict);
+    void check_rewrite();
+    bool is_rewriting() const { return rewriting_; }
 
-    bool startBackgroundRewrite(ProgressiveDict& dict);
-    void checkBackgroundRewriteStatus();
+    bool load(const CommandCallback& callback);
 
-    bool isRewriteInProgress() const { return rewrite_in_progress_; }
+    void set_policy(FsyncPolicy policy) { policy_ = policy; }
+    FsyncPolicy policy() const { return policy_; }
 
-    bool loadAof(const CommandCallback& callback);
-
-    void setFsyncPolicy(AofFsyncPolicy policy) { policy_ = policy; }
-    AofFsyncPolicy getFsyncPolicy() const { return policy_; }
-
-    size_t getFileSize() const;
+    size_t size() const;
 
 private:
     std::string filename_;
     std::string temp_filename_{"temp-rewrite.aof"};
-    AofFsyncPolicy policy_;
+    FsyncPolicy policy_;
     int fd_{-1};
 
-    std::atomic<bool> rewrite_in_progress_{false};
+    std::atomic<bool> rewriting_{false};
+    std::atomic<bool> rewrite_done_{false};
     int child_pid_{-1};
-    std::string rewrite_buffer_;
+    std::string rewrite_buf_;
 
     std::atomic<bool> stop_fsync_thread_{false};
     std::thread fsync_thread_;
     std::atomic<bool> needs_fsync_{false};
 
-    void fsyncWorkerLoop();
-    void performFsync();
-    void writeToFile(int target_fd, const std::string& data);
-    void writeDumpToFile(int target_fd, ProgressiveDict& dict);
-    void finishBackgroundRewrite();
+    void fsync_worker();
+    void sync();
+    void write_raw(int target_fd, const std::string& data);
+    void write_dump(int target_fd, Dict& dict);
+    void finish_rewrite();
 };
 
 }

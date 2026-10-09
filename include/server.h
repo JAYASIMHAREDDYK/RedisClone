@@ -3,7 +3,7 @@
 #include "dict.h"
 #include "skiplist.h"
 #include "resp.h"
-#include "eviction.h"
+#include "evict.h"
 #include "expire.h"
 #include "aof.h"
 #include "net.h"
@@ -15,18 +15,18 @@
 
 namespace redis {
 
-struct ServerConfig {
+struct Config {
     std::string bind_ip{"0.0.0.0"};
     int port{6379};
     size_t maxmemory{0};
-    EvictionPolicy eviction_policy{EvictionPolicy::AllKeysLFU};
+    EvictPolicy eviction_policy{EvictPolicy::AllKeysLFU};
     bool aof_enabled{true};
     std::string aof_filename{"appendonly.aof"};
-    AofFsyncPolicy aof_fsync{AofFsyncPolicy::EverySec};
+    FsyncPolicy aof_fsync{FsyncPolicy::EverySec};
     uint32_t client_timeout{0};
 };
 
-struct ServerStats {
+struct Stats {
     uint64_t start_time_sec{0};
     std::atomic<uint64_t> total_commands_processed{0};
     std::atomic<uint64_t> total_connections_received{0};
@@ -35,7 +35,7 @@ struct ServerStats {
 
 class Server {
 public:
-    explicit Server(ServerConfig config = ServerConfig{});
+    explicit Server(Config config = Config{});
     ~Server();
 
     Server(const Server&) = delete;
@@ -44,48 +44,48 @@ public:
     bool start();
     void stop();
 
-    void executeCommand(ClientConnection& client, const std::vector<std::string>& args);
+    void execute(Client& client, const std::vector<std::string>& args);
 
-    size_t getMemoryUsage() const { return stats_.used_memory_bytes.load(); }
-    size_t getKeyCount() const { return dict_.size(); }
+    size_t memory_used() const { return stats_.used_memory_bytes.load(); }
+    size_t key_count() const { return dict_.size(); }
 
-    ProgressiveDict& getDict() { return dict_; }
+    Dict& dict() { return dict_; }
 
 private:
-    ServerConfig config_;
-    ServerStats stats_;
+    Config config_;
+    Stats stats_;
     bool running_{false};
 
-    ProgressiveDict dict_;
-    EvictionEngine eviction_;
-    ExpirationManager expire_;
-    AofEngine aof_;
-    EventReactor reactor_;
+    Dict dict_;
+    Evictor eviction_;
+    Expirer expire_;
+    Aof aof_;
+    EventLoop loop_;
 
-    void registerHandlers();
-    void handlePeriodicTasks();
+    void setup_handlers();
+    void cron();
 
-    void checkEviction();
-    bool deleteKeyInternal(const std::string& key);
+    void evict_if_needed();
+    bool del_key(const std::string& key);
 
-    void cmdPing(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdEcho(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdSet(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdGet(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdDel(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdExists(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdExpire(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdTtl(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdZAdd(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdZRange(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdZRangeByScore(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdZScore(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdZCard(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdBgRewriteAof(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdInfo(ClientConnection& client, const std::vector<std::string>& args);
-    void cmdCommand(ClientConnection& client, const std::vector<std::string>& args);
+    void cmd_ping(Client& client, const std::vector<std::string>& args);
+    void cmd_echo(Client& client, const std::vector<std::string>& args);
+    void cmd_set(Client& client, const std::vector<std::string>& args);
+    void cmd_get(Client& client, const std::vector<std::string>& args);
+    void cmd_del(Client& client, const std::vector<std::string>& args);
+    void cmd_exists(Client& client, const std::vector<std::string>& args);
+    void cmd_expire(Client& client, const std::vector<std::string>& args);
+    void cmd_ttl(Client& client, const std::vector<std::string>& args);
+    void cmd_zadd(Client& client, const std::vector<std::string>& args);
+    void cmd_zrange(Client& client, const std::vector<std::string>& args);
+    void cmd_zrangebyscore(Client& client, const std::vector<std::string>& args);
+    void cmd_zscore(Client& client, const std::vector<std::string>& args);
+    void cmd_zcard(Client& client, const std::vector<std::string>& args);
+    void cmd_bgrewriteaof(Client& client, const std::vector<std::string>& args);
+    void cmd_info(Client& client, const std::vector<std::string>& args);
+    void cmd_command(Client& client, const std::vector<std::string>& args);
 
-    size_t estimateEntrySize(const std::string& key, const DictValue& value);
+    size_t estimate_size(const std::string& key, const Value& value);
 };
 
 }

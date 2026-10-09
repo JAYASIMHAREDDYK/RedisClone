@@ -1,32 +1,35 @@
 #include "expire.h"
-#include "util.h"
+#include "common.h"
 #include <random>
 #include <algorithm>
 
+using std::string;
+using std::vector;
+
 namespace redis {
 
-void ExpirationManager::setExpire(DictEntry* entry, uint64_t expire_at_ms) {
+void Expirer::set_expire(Entry* entry, uint64_t expire_at_ms) {
     if (!entry) return;
     entry->expire_at_ms = expire_at_ms;
     expiring_keys_.insert(entry->key);
 }
 
-void ExpirationManager::clearExpire(DictEntry* entry) {
+void Expirer::clear_expire(Entry* entry) {
     if (!entry) return;
     entry->expire_at_ms = 0;
     expiring_keys_.erase(entry->key);
 }
 
-bool ExpirationManager::isExpired(DictEntry* entry) const {
+bool Expirer::is_expired(Entry* entry) const {
     if (!entry || entry->expire_at_ms == 0) return false;
-    return getUnixTimeMs() >= entry->expire_at_ms;
+    return unix_time_ms() >= entry->expire_at_ms;
 }
 
-int64_t ExpirationManager::getTtlSeconds(DictEntry* entry) const {
+int64_t Expirer::ttl_sec(Entry* entry) const {
     if (!entry) return -2;
     if (entry->expire_at_ms == 0) return -1;
 
-    uint64_t now = getUnixTimeMs();
+    uint64_t now = unix_time_ms();
     if (now >= entry->expire_at_ms) {
         return -2;
     }
@@ -35,14 +38,14 @@ int64_t ExpirationManager::getTtlSeconds(DictEntry* entry) const {
     return static_cast<int64_t>((diff_ms + 999) / 1000);
 }
 
-void ExpirationManager::onKeyDeleted(const std::string& key) {
+void Expirer::on_delete(const string& key) {
     expiring_keys_.erase(key);
 }
 
-int ExpirationManager::activeExpireCycle(ProgressiveDict& dict, const DeleteCallback& on_delete, int max_ms) {
+int Expirer::sample_expired(Dict& dict, const DeleteCallback& on_delete, int max_ms) {
     if (expiring_keys_.empty()) return 0;
 
-    uint64_t start = getMonotonicTimeMs();
+    uint64_t start = monotonic_time_ms();
     int total_deleted = 0;
 
     static thread_local std::mt19937_64 rng(101);
@@ -51,7 +54,7 @@ int ExpirationManager::activeExpireCycle(ProgressiveDict& dict, const DeleteCall
         if (expiring_keys_.empty()) break;
 
         size_t sample_size = std::min(static_cast<size_t>(20), expiring_keys_.size());
-        std::vector<std::string> sampled;
+        vector<string> sampled;
         sampled.reserve(sample_size);
 
         size_t skip = rng() % expiring_keys_.size();
@@ -68,24 +71,26 @@ int ExpirationManager::activeExpireCycle(ProgressiveDict& dict, const DeleteCall
 
         int expired_in_sample = 0;
         for (const auto& key : sampled) {
-            DictEntry* entry = dict.find(key);
+            Entry* entry = dict.find(key);
             if (!entry) {
                 expiring_keys_.erase(key);
                 continue;
             }
 
-            if (isExpired(entry)) {
+            if (is_expired(entry)) {
                 on_delete(key);
                 expired_in_sample++;
                 total_deleted++;
             }
         }
 
+        // Active expiry stopping condition: if <= 25% of sampled keys expired, stop loop
         if (expired_in_sample <= static_cast<int>(sample_size) / 4) {
             break;
         }
 
-        if (static_cast<int>(getMonotonicTimeMs() - start) >= max_ms) {
+        // Hard time cap to avoid blocking the reactor loop
+        if (static_cast<int>(monotonic_time_ms() - start) >= max_ms) {
             break;
         }
     }

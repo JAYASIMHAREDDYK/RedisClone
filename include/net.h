@@ -26,42 +26,42 @@ constexpr socket_t INVALID_SOCK = -1;
 
 namespace redis {
 
-struct ClientConnection {
+struct Client {
     socket_t fd{INVALID_SOCK};
     std::string ip;
     uint16_t port{0};
     RespParser parser;
-    std::string write_buffer;
+    std::string write_buf;
     uint64_t last_active_time{0};
     bool close_after_write{false};
 
-    ClientConnection(socket_t sock, std::string client_ip, uint16_t client_port);
-    ~ClientConnection();
+    Client(socket_t sock, std::string client_ip, uint16_t client_port);
+    ~Client();
 
-    void appendWrite(std::string_view data);
+    void write(std::string_view data);
 };
 
-class EventReactor {
+class EventLoop {
 public:
-    using CommandHandler = std::function<void(ClientConnection&, const std::vector<std::string>&)>;
-    using PeriodicHandler = std::function<void()>;
+    using CommandHandler = std::function<void(Client&, const std::vector<std::string>&)>;
+    using TickHandler = std::function<void()>;
 
-    EventReactor(std::string bind_ip = "0.0.0.0", int port = 6379);
-    ~EventReactor();
+    EventLoop(std::string bind_ip = "0.0.0.0", int port = 6379);
+    ~EventLoop();
 
-    EventReactor(const EventReactor&) = delete;
-    EventReactor& operator=(const EventReactor&) = delete;
+    EventLoop(const EventLoop&) = delete;
+    EventLoop& operator=(const EventLoop&) = delete;
 
     bool init();
     void run();
     void stop();
 
-    void setCommandHandler(CommandHandler handler) { command_handler_ = std::move(handler); }
-    void setPeriodicHandler(PeriodicHandler handler) { periodic_handler_ = std::move(handler); }
-    void setIdleTimeout(uint32_t seconds) { idle_timeout_sec_ = seconds; }
+    void on_command(CommandHandler handler) { command_handler_ = std::move(handler); }
+    void on_tick(TickHandler handler) { tick_handler_ = std::move(handler); }
+    void set_idle_timeout(uint32_t seconds) { idle_timeout_sec_ = seconds; }
 
-    size_t activeClientsCount() const { return clients_.size(); }
-    void closeClient(socket_t fd);
+    size_t client_count() const { return clients_.size(); }
+    void close(socket_t fd);
 
 private:
     std::string bind_ip_;
@@ -71,24 +71,24 @@ private:
     uint32_t idle_timeout_sec_{0};
 
     CommandHandler command_handler_;
-    PeriodicHandler periodic_handler_;
+    TickHandler tick_handler_;
 
-    std::unordered_map<socket_t, std::unique_ptr<ClientConnection>> clients_;
+    std::unordered_map<socket_t, std::unique_ptr<Client>> clients_;
 
 #ifndef _WIN32
     int epoll_fd_{-1};
-    void updateEpoll(socket_t fd, uint32_t events, int op);
-    void handleEpollEvents();
+    void update_epoll(socket_t fd, uint32_t events, int op);
+    void poll_events();
 #else
-    void handlePollEvents();
+    void poll_events();
 #endif
 
-    bool setNonBlocking(socket_t fd);
-    bool setTcpNoDelay(socket_t fd);
-    void acceptConnections();
-    void readFromClient(ClientConnection& client);
-    void writeToClient(ClientConnection& client);
-    void checkIdleClients();
+    bool set_nonblocking(socket_t fd);
+    bool set_nodelay(socket_t fd);
+    void accept_all();
+    void read_client(Client& client);
+    void write_client(Client& client);
+    void prune_idle();
 };
 
 }

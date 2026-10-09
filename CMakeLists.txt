@@ -7,17 +7,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
     add_compile_options(/W4 /O2)
 else()
-    add_compile_options(-Wall -Wextra -O3)
+    add_compile_options(-Wall -Wextra -O2)
 endif()
 
 include_directories(include)
 
 set(CORE_SOURCES
-    src/util.cpp
+    src/common.cpp
     src/skiplist.cpp
     src/dict.cpp
     src/resp.cpp
-    src/eviction.cpp
+    src/evict.cpp
     src/expire.cpp
     src/aof.cpp
     src/net.cpp

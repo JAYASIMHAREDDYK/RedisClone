@@ -11,88 +11,86 @@
 
 namespace redis {
 
-using DictValue = std::variant<std::string, std::shared_ptr<SortedSet>>;
+class ZSet;
+using Value = std::variant<std::string, std::shared_ptr<ZSet>>;
 
-struct DictEntry {
+struct Entry {
     std::string key;
-    DictValue value;
+    Value value;
     uint64_t expire_at_ms{0};
     uint32_t frequency{1};
     uint32_t last_accessed_time{0};
-    DictEntry* next{nullptr};
+    Entry* next{nullptr};
 
-    DictEntry* lfu_prev{nullptr};
-    DictEntry* lfu_next{nullptr};
+    Entry* lfu_prev{nullptr};
+    Entry* lfu_next{nullptr};
     void* frequency_bucket{nullptr};
 
-    DictEntry(std::string k, DictValue v);
-    ~DictEntry() = default;
+    Entry(std::string k, Value v);
 
-    bool isString() const {
+    bool is_str() const {
         return std::holds_alternative<std::string>(value);
     }
 
-    bool isZSet() const {
-        return std::holds_alternative<std::shared_ptr<SortedSet>>(value);
+    bool is_zset() const {
+        return std::holds_alternative<std::shared_ptr<ZSet>>(value);
     }
 
-    const std::string& getString() const {
+    const std::string& str() const {
         return std::get<std::string>(value);
     }
 
-    std::string& getString() {
+    std::string& str() {
         return std::get<std::string>(value);
     }
 
-    std::shared_ptr<SortedSet> getZSet() const {
-        return std::get<std::shared_ptr<SortedSet>>(value);
+    std::shared_ptr<ZSet> zset() const {
+        return std::get<std::shared_ptr<ZSet>>(value);
     }
 };
 
-struct DictTable {
-    DictEntry** table{nullptr};
+struct Table {
+    Entry** table{nullptr};
     size_t size{0};
     size_t sizemask{0};
     size_t used{0};
 };
 
-class ProgressiveDict {
+class Dict {
 public:
-    DictTable ht[2];
+    Table ht[2];
     int64_t rehashidx{-1};
 
-    ProgressiveDict();
-    ~ProgressiveDict();
+    Dict();
+    ~Dict();
 
-    ProgressiveDict(const ProgressiveDict&) = delete;
-    ProgressiveDict& operator=(const ProgressiveDict&) = delete;
+    Dict(const Dict&) = delete;
+    Dict& operator=(const Dict&) = delete;
 
-    bool isRehashing() const {
+    bool is_rehashing() const {
         return rehashidx != -1;
     }
 
-    void stepRehash(int n = 1);
-    void rehashMilliseconds(int ms);
+    void step_rehash(int n = 1);
+    void rehash_ms(int ms);
 
-    bool set(const std::string& key, DictValue val);
-    DictEntry* find(std::string_view key);
+    bool set(const std::string& key, Value val);
+    Entry* find(std::string_view key);
     bool erase(std::string_view key);
 
     size_t size() const {
         return ht[0].used + ht[1].used;
     }
 
-    DictEntry* getRandomEntry();
-
-    void forEach(const std::function<void(DictEntry*)>& callback);
-
+    Entry* random_entry();
+    void scan(const std::function<void(Entry*)>& callback);
     void clear();
 
 private:
-    void expandIfNeeded();
+    void expand_if_needed();
     void resize(size_t new_size);
-    static size_t nextPowerOf2(size_t size);
-    void freeTable(DictTable& t);
+    static size_t next_pow2(size_t size);
+    void free_table(Table& t);
 };
 
 }

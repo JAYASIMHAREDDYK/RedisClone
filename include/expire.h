@@ -9,26 +9,23 @@
 
 namespace redis {
 
-class ExpirationManager {
+class Expirer {
 public:
     using DeleteCallback = std::function<void(const std::string&)>;
 
-    ExpirationManager() = default;
-    ~ExpirationManager() = default;
+    Expirer() = default;
+    ~Expirer() = default;
 
-    void setExpire(DictEntry* entry, uint64_t expire_at_ms);
-    void clearExpire(DictEntry* entry);
+    void set_expire(Entry* entry, uint64_t expire_at_ms);
+    void clear_expire(Entry* entry);
 
-    bool isExpired(DictEntry* entry) const;
+    bool is_expired(Entry* entry) const;
+    int64_t ttl_sec(Entry* entry) const;
 
-    int64_t getTtlSeconds(DictEntry* entry) const;
+    int sample_expired(Dict& dict, const DeleteCallback& on_delete, int max_ms = 10);
+    void on_delete(const std::string& key);
 
-    int activeExpireCycle(ProgressiveDict& dict, const DeleteCallback& on_delete, int max_ms = 10);
-
-    void onKeyDeleted(const std::string& key);
-
-    size_t expiringKeysCount() const { return expiring_keys_.size(); }
-
+    size_t size() const { return expiring_keys_.size(); }
     void clear() { expiring_keys_.clear(); }
 
 private:

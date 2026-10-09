@@ -1,19 +1,23 @@
 #include "net.h"
-#include "util.h"
+#include "common.h"
 #include <cstring>
 #include <vector>
-#include <iostream>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
+using std::string;
+using std::string_view;
+using std::vector;
+using std::make_unique;
+
 namespace redis {
 
-ClientConnection::ClientConnection(socket_t sock, std::string client_ip, uint16_t client_port)
-    : fd(sock), ip(std::move(client_ip)), port(client_port), last_active_time(getUnixTimeSec()) {}
+Client::Client(socket_t sock, string client_ip, uint16_t client_port)
+    : fd(sock), ip(std::move(client_ip)), port(client_port), last_active_time(unix_time_sec()) {}
 
-ClientConnection::~ClientConnection() {
+Client::~Client() {
     if (fd != INVALID_SOCK) {
 #ifdef _WIN32
         closesocket(fd);
@@ -24,11 +28,11 @@ ClientConnection::~ClientConnection() {
     }
 }
 
-void ClientConnection::appendWrite(std::string_view data) {
-    write_buffer.append(data);
+void Client::write(string_view data) {
+    write_buf.append(data);
 }
 
-EventReactor::EventReactor(std::string bind_ip, int port)
+EventLoop::EventLoop(string bind_ip, int port)
     : bind_ip_(std::move(bind_ip)), port_(port) {
 #ifdef _WIN32
     WSADATA wsa;
@@ -36,14 +40,14 @@ EventReactor::EventReactor(std::string bind_ip, int port)
 #endif
 }
 
-EventReactor::~EventReactor() {
+EventLoop::~EventLoop() {
     stop();
 #ifdef _WIN32
     WSACleanup();
 #endif
 }
 
-bool EventReactor::setNonBlocking(socket_t fd) {
+bool EventLoop::set_nonblocking(socket_t fd) {
 #ifdef _WIN32
     u_long mode = 1;
     return ioctlsocket(fd, FIONBIO, &mode) == 0;
@@ -54,7 +58,7 @@ bool EventReactor::setNonBlocking(socket_t fd) {
 #endif
 }
 
-bool EventReactor::setTcpNoDelay(socket_t fd) {
+bool EventLoop::set_nodelay(socket_t fd) {
     int val = 1;
 #ifdef _WIN32
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&val), sizeof(val)) == 0;
@@ -63,11 +67,9 @@ bool EventReactor::setTcpNoDelay(socket_t fd) {
 #endif
 }
 
-bool EventReactor::init() {
+bool EventLoop::init() {
     server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd_ == INVALID_SOCK) {
-        return false;
-    }
+    if (server_fd_ == INVALID_SOCK) return false;
 
     int reuse = 1;
 #ifdef _WIN32
@@ -76,8 +78,8 @@ bool EventReactor::init() {
     setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #endif
 
-    setNonBlocking(server_fd_);
-    setTcpNoDelay(server_fd_);
+    set_nonblocking(server_fd_);
+    set_nodelay(server_fd_);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -111,14 +113,14 @@ bool EventReactor::init() {
         server_fd_ = INVALID_SOCK;
         return false;
     }
-    updateEpoll(server_fd_, EPOLLIN | EPOLLET, EPOLL_CTL_ADD);
+    update_epoll(server_fd_, EPOLLIN | EPOLLET, EPOLL_CTL_ADD);
 #endif
 
     return true;
 }
 
 #ifndef _WIN32
-void EventReactor::updateEpoll(socket_t fd, uint32_t events, int op) {
+void EventLoop::update_epoll(socket_t fd, uint32_t events, int op) {
     epoll_event ev{};
     ev.events = events;
     ev.data.fd = fd;
@@ -126,52 +128,46 @@ void EventReactor::updateEpoll(socket_t fd, uint32_t events, int op) {
 }
 #endif
 
-void EventReactor::acceptConnections() {
+void EventLoop::accept_all() {
     while (true) {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
 
         socket_t client_fd = ::accept(server_fd_, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
-        if (client_fd == INVALID_SOCK) {
-            break;
-        }
+        if (client_fd == INVALID_SOCK) break;
 
-        setNonBlocking(client_fd);
-        setTcpNoDelay(client_fd);
+        set_nonblocking(client_fd);
+        set_nodelay(client_fd);
 
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
         uint16_t client_port = ntohs(client_addr.sin_port);
 
-        clients_[client_fd] = std::make_unique<ClientConnection>(client_fd, ip_str, client_port);
+        clients_[client_fd] = make_unique<Client>(client_fd, ip_str, client_port);
 
 #ifndef _WIN32
-        updateEpoll(client_fd, EPOLLIN | EPOLLET, EPOLL_CTL_ADD);
+        update_epoll(client_fd, EPOLLIN | EPOLLET, EPOLL_CTL_ADD);
 #endif
     }
 }
 
-void EventReactor::readFromClient(ClientConnection& client) {
+void EventLoop::read_client(Client& client) {
     char buf[16384];
     bool disconnect = false;
 
+    // Edge-triggered drain: loop recv() until EAGAIN/EWOULDBLOCK
     while (true) {
 #ifdef _WIN32
         int n = recv(client.fd, buf, sizeof(buf), 0);
         if (n == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                break;
-            }
+            if (WSAGetLastError() == WSAEWOULDBLOCK) break;
             disconnect = true;
             break;
         }
 #else
         int n = ::recv(client.fd, buf, sizeof(buf), 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             disconnect = true;
             break;
         }
@@ -181,11 +177,11 @@ void EventReactor::readFromClient(ClientConnection& client) {
             break;
         }
 
-        client.last_active_time = getUnixTimeSec();
+        client.last_active_time = unix_time_sec();
         client.parser.feed(buf, n);
 
-        std::vector<std::string> args;
-        while (client.parser.nextCommand(args)) {
+        vector<string> args;
+        while (client.parser.next_command(args)) {
             if (command_handler_) {
                 command_handler_(client, args);
             }
@@ -193,55 +189,48 @@ void EventReactor::readFromClient(ClientConnection& client) {
     }
 
     if (disconnect) {
-        closeClient(client.fd);
-    } else {
-        if (!client.write_buffer.empty()) {
-            writeToClient(client);
-        }
+        close(client.fd);
+    } else if (!client.write_buf.empty()) {
+        write_client(client);
     }
 }
 
-void EventReactor::writeToClient(ClientConnection& client) {
-    while (!client.write_buffer.empty()) {
+void EventLoop::write_client(Client& client) {
+    while (!client.write_buf.empty()) {
 #ifdef _WIN32
-        int n = send(client.fd, client.write_buffer.data(), static_cast<int>(client.write_buffer.size()), 0);
+        int n = send(client.fd, client.write_buf.data(), static_cast<int>(client.write_buf.size()), 0);
         if (n == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                break;
-            }
-            closeClient(client.fd);
+            if (WSAGetLastError() == WSAEWOULDBLOCK) break;
+            close(client.fd);
             return;
         }
 #else
-        int n = ::send(client.fd, client.write_buffer.data(), client.write_buffer.size(), 0);
+        int n = ::send(client.fd, client.write_buf.data(), client.write_buf.size(), 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            closeClient(client.fd);
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            close(client.fd);
             return;
         }
 #endif
         if (n > 0) {
-            client.write_buffer.erase(0, n);
+            client.write_buf.erase(0, n);
         }
     }
 
 #ifndef _WIN32
-    if (!client.write_buffer.empty()) {
-        updateEpoll(client.fd, EPOLLIN | EPOLLOUT | EPOLLET, EPOLL_CTL_MOD);
+    if (!client.write_buf.empty()) {
+        update_epoll(client.fd, EPOLLIN | EPOLLOUT | EPOLLET, EPOLL_CTL_MOD);
     } else {
-        updateEpoll(client.fd, EPOLLIN | EPOLLET, EPOLL_CTL_MOD);
+        update_epoll(client.fd, EPOLLIN | EPOLLET, EPOLL_CTL_MOD);
     }
 #endif
 
-    if (client.write_buffer.empty() && client.close_after_write) {
-        closeClient(client.fd);
+    if (client.write_buf.empty() && client.close_after_write) {
+        close(client.fd);
     }
 }
 
-void EventReactor::closeClient(socket_t fd) {
+void EventLoop::close(socket_t fd) {
 #ifndef _WIN32
     if (epoll_fd_ >= 0) {
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
@@ -250,11 +239,11 @@ void EventReactor::closeClient(socket_t fd) {
     clients_.erase(fd);
 }
 
-void EventReactor::checkIdleClients() {
+void EventLoop::prune_idle() {
     if (idle_timeout_sec_ == 0) return;
 
-    uint64_t now = getUnixTimeSec();
-    std::vector<socket_t> to_close;
+    uint64_t now = unix_time_sec();
+    vector<socket_t> to_close;
 
     for (const auto& [fd, client] : clients_) {
         if (now - client->last_active_time >= idle_timeout_sec_) {
@@ -263,12 +252,12 @@ void EventReactor::checkIdleClients() {
     }
 
     for (socket_t fd : to_close) {
-        closeClient(fd);
+        close(fd);
     }
 }
 
 #ifndef _WIN32
-void EventReactor::handleEpollEvents() {
+void EventLoop::poll_events() {
     constexpr int MAX_EVENTS = 1024;
     epoll_event events[MAX_EVENTS];
 
@@ -278,7 +267,7 @@ void EventReactor::handleEpollEvents() {
         uint32_t ev = events[i].events;
 
         if (fd == server_fd_) {
-            acceptConnections();
+            accept_all();
             continue;
         }
 
@@ -286,22 +275,22 @@ void EventReactor::handleEpollEvents() {
         if (it == clients_.end()) continue;
 
         if (ev & (EPOLLERR | EPOLLHUP)) {
-            closeClient(fd);
+            close(fd);
             continue;
         }
 
         if (ev & EPOLLIN) {
-            readFromClient(*(it->second));
+            read_client(*(it->second));
         }
 
         if (clients_.count(fd) && (ev & EPOLLOUT)) {
-            writeToClient(*(it->second));
+            write_client(*(it->second));
         }
     }
 }
 #else
-void EventReactor::handlePollEvents() {
-    std::vector<WSAPOLLFD> fds;
+void EventLoop::poll_events() {
+    vector<WSAPOLLFD> fds;
     fds.reserve(clients_.size() + 1);
 
     WSAPOLLFD server_poll{};
@@ -312,7 +301,7 @@ void EventReactor::handlePollEvents() {
     for (const auto& [fd, client] : clients_) {
         WSAPOLLFD pfd{};
         pfd.fd = fd;
-        pfd.events = POLLIN | (client->write_buffer.empty() ? 0 : POLLOUT);
+        pfd.events = POLLIN | (client->write_buf.empty() ? 0 : POLLOUT);
         fds.push_back(pfd);
     }
 
@@ -320,7 +309,7 @@ void EventReactor::handlePollEvents() {
     if (ret <= 0) return;
 
     if (fds[0].revents & POLLIN) {
-        acceptConnections();
+        accept_all();
     }
 
     for (size_t i = 1; i < fds.size(); ++i) {
@@ -331,47 +320,42 @@ void EventReactor::handlePollEvents() {
         if (it == clients_.end()) continue;
 
         if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            closeClient(client_fd);
+            close(client_fd);
             continue;
         }
 
         if (revents & POLLIN) {
-            readFromClient(*(it->second));
+            read_client(*(it->second));
         }
 
         if (clients_.count(client_fd) && (revents & POLLOUT)) {
-            writeToClient(*(it->second));
+            write_client(*(it->second));
         }
     }
 }
 #endif
 
-void EventReactor::run() {
+void EventLoop::run() {
     running_ = true;
-    uint64_t last_idle_check = getMonotonicTimeMs();
+    uint64_t last_idle_check = monotonic_time_ms();
 
     while (running_) {
-#ifndef _WIN32
-        handleEpollEvents();
-#else
-        handlePollEvents();
-#endif
+        poll_events();
 
-        if (periodic_handler_) {
-            periodic_handler_();
+        if (tick_handler_) {
+            tick_handler_();
         }
 
-        uint64_t now = getMonotonicTimeMs();
+        uint64_t now = monotonic_time_ms();
         if (now - last_idle_check >= 5000) {
-            checkIdleClients();
+            prune_idle();
             last_idle_check = now;
         }
     }
 }
 
-void EventReactor::stop() {
+void EventLoop::stop() {
     running_ = false;
-
     clients_.clear();
 
     if (server_fd_ != INVALID_SOCK) {

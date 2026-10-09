@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O3 -Iinclude
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Iinclude
 
 ifeq ($(OS),Windows_NT)
     LDFLAGS = -lws2_32
@@ -11,11 +11,11 @@ else
     TEST_TARGET = unit_tests
 endif
 
-SRCS = src/util.cpp \
+SRCS = src/common.cpp \
        src/skiplist.cpp \
        src/dict.cpp \
        src/resp.cpp \
-       src/eviction.cpp \
+       src/evict.cpp \
        src/expire.cpp \
        src/aof.cpp \
        src/net.cpp \

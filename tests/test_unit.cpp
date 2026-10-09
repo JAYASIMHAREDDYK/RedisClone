@@ -1,72 +1,75 @@
-#include "util.h"
+#include "common.h"
 #include "skiplist.h"
 #include "dict.h"
 #include "resp.h"
-#include "eviction.h"
+#include "evict.h"
 #include "expire.h"
 #include <iostream>
 #include <cassert>
 #include <string>
 #include <vector>
 
-void testUtils() {
-    std::string s = "hello world";
-    redis::toUpper(s);
+using std::string;
+using std::vector;
+using std::cout;
+using std::endl;
+
+void test_common() {
+    string s = "hello world";
+    redis::to_upper(s);
     assert(s == "HELLO WORLD");
 
-    std::string s2 = "HeLLo";
-    redis::toLower(s2);
+    string s2 = "HeLLo";
+    redis::to_lower(s2);
     assert(s2 == "hello");
 
-    auto num = redis::parseInteger("123456");
+    auto num = redis::parse_int("123456");
     assert(num.has_value() && *num == 123456);
 
-    auto num_neg = redis::parseInteger("-9876");
+    auto num_neg = redis::parse_int("-9876");
     assert(num_neg.has_value() && *num_neg == -9876);
 
-    auto d = redis::parseDouble("3.14159");
+    auto d = redis::parse_double("3.14159");
     assert(d.has_value() && std::abs(*d - 3.14159) < 1e-5);
 
-    uint64_t h1 = redis::hashKey("test_key");
-    uint64_t h2 = redis::hashKey("test_key");
+    uint64_t h1 = redis::hash_key("test_key");
+    uint64_t h2 = redis::hash_key("test_key");
     assert(h1 == h2);
     assert(h1 != 0);
 }
 
-void testDict() {
-    redis::ProgressiveDict dict;
+void test_dict() {
+    redis::Dict dict;
 
     assert(dict.set("key1", "val1") == true);
     assert(dict.set("key2", "val2") == true);
     assert(dict.set("key3", "val3") == true);
     assert(dict.set("key4", "val4") == true);
-
     assert(dict.size() == 4);
 
     auto* e1 = dict.find("key1");
-    assert(e1 != nullptr && e1->getString() == "val1");
+    assert(e1 != nullptr && e1->str() == "val1");
 
     auto* e2 = dict.find("key2");
-    assert(e2 != nullptr && e2->getString() == "val2");
+    assert(e2 != nullptr && e2->str() == "val2");
 
     assert(dict.set("key1", "updated_val1") == false);
     e1 = dict.find("key1");
-    assert(e1 != nullptr && e1->getString() == "updated_val1");
+    assert(e1 != nullptr && e1->str() == "updated_val1");
 
     for (int i = 5; i <= 200; ++i) {
         dict.set("k" + std::to_string(i), "v" + std::to_string(i));
     }
-
     assert(dict.size() == 200);
 
-    while (dict.isRehashing()) {
-        dict.stepRehash(1);
+    while (dict.is_rehashing()) {
+        dict.step_rehash(1);
     }
-    assert(!dict.isRehashing());
+    assert(!dict.is_rehashing());
 
     for (int i = 5; i <= 200; ++i) {
         auto* e = dict.find("k" + std::to_string(i));
-        assert(e != nullptr && e->getString() == ("v" + std::to_string(i)));
+        assert(e != nullptr && e->str() == ("v" + std::to_string(i)));
     }
 
     assert(dict.erase("k10") == true);
@@ -74,39 +77,38 @@ void testDict() {
     assert(dict.size() == 199);
 }
 
-void testSkipList() {
-    redis::SortedSet zset;
+void test_skiplist() {
+    redis::ZSet zset;
 
     assert(zset.add(10.0, "alice") == true);
     assert(zset.add(20.0, "bob") == true);
     assert(zset.add(15.0, "charlie") == true);
     assert(zset.add(5.0, "david") == true);
-
     assert(zset.size() == 4);
 
-    auto score = zset.getScore("charlie");
+    auto score = zset.score_of("charlie");
     assert(score.has_value() && *score == 15.0);
 
-    auto rank_david = zset.getRank("david");
+    auto rank_david = zset.rank_of("david");
     assert(rank_david.has_value() && *rank_david == 0);
 
-    auto rank_alice = zset.getRank("alice");
+    auto rank_alice = zset.rank_of("alice");
     assert(rank_alice.has_value() && *rank_alice == 1);
 
-    auto rank_charlie = zset.getRank("charlie");
+    auto rank_charlie = zset.rank_of("charlie");
     assert(rank_charlie.has_value() && *rank_charlie == 2);
 
-    auto rank_bob = zset.getRank("bob");
+    auto rank_bob = zset.rank_of("bob");
     assert(rank_bob.has_value() && *rank_bob == 3);
 
-    auto range = zset.range(0, -1);
-    assert(range.size() == 4);
-    assert(range[0].first == "david");
-    assert(range[1].first == "alice");
-    assert(range[2].first == "charlie");
-    assert(range[3].first == "bob");
+    auto r = zset.range(0, -1);
+    assert(r.size() == 4);
+    assert(r[0].first == "david");
+    assert(r[1].first == "alice");
+    assert(r[2].first == "charlie");
+    assert(r[3].first == "bob");
 
-    auto by_score = zset.rangeByScore(10.0, 20.0);
+    auto by_score = zset.range_by_score(10.0, 20.0);
     assert(by_score.size() == 3);
     assert(by_score[0].first == "alice");
     assert(by_score[1].first == "charlie");
@@ -114,114 +116,119 @@ void testSkipList() {
 
     assert(zset.add(25.0, "alice") == false);
     assert(zset.size() == 4);
-    auto new_rank_alice = zset.getRank("alice");
-    assert(new_rank_alice.has_value() && *new_rank_alice == 3);
+    assert(*zset.rank_of("alice") == 3);
 
     assert(zset.remove("david") == true);
     assert(zset.size() == 3);
-    assert(zset.getRank("david").has_value() == false);
+    assert(zset.rank_of("david").has_value() == false);
 }
 
-void testResp() {
+void test_resp_parser_framing() {
     redis::RespParser parser;
 
-    std::string stream = "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$4\r\njohn\r\n*1\r\n$4\r\nPING\r\n";
-    parser.feed(stream);
+    // Normal complete command
+    parser.feed("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n");
+    vector<string> cmd;
+    assert(parser.next_command(cmd) == true);
+    assert(cmd.size() == 3 && cmd[0] == "SET" && cmd[1] == "a" && cmd[2] == "b");
+    assert(parser.next_command(cmd) == false);
 
-    std::vector<std::string> cmd1;
-    assert(parser.nextCommand(cmd1) == true);
-    assert(cmd1.size() == 3);
-    assert(cmd1[0] == "SET");
-    assert(cmd1[1] == "name");
-    assert(cmd1[2] == "john");
-
-    std::vector<std::string> cmd2;
-    assert(parser.nextCommand(cmd2) == true);
-    assert(cmd2.size() == 1);
-    assert(cmd2[0] == "PING");
-
-    std::vector<std::string> cmd3;
-    assert(parser.nextCommand(cmd3) == false);
-
+    // Partial reads across chunk boundaries
     parser.feed("*2\r\n$3\r\nGE");
-    assert(parser.nextCommand(cmd3) == false);
-    parser.feed("T\r\n$4\r\nuser\r\n");
-    assert(parser.nextCommand(cmd3) == true);
-    assert(cmd3.size() == 2);
-    assert(cmd3[0] == "GET");
-    assert(cmd3[1] == "user");
+    assert(parser.next_command(cmd) == false);
+    parser.feed("T\r\n$1\r\nx");
+    assert(parser.next_command(cmd) == false);
+    parser.feed("\r\n");
+    assert(parser.next_command(cmd) == true);
+    assert(cmd.size() == 2 && cmd[0] == "GET" && cmd[1] == "x");
 
-    assert(redis::RespEncoder::simpleString("OK") == "+OK\r\n");
-    assert(redis::RespEncoder::integer(42) == ":42\r\n");
-    assert(redis::RespEncoder::bulkString("hi") == "$2\r\nhi\r\n");
-    assert(redis::RespEncoder::nullBulkString() == "$-1\r\n");
+    // Split CRLF across chunks
+    parser.feed("*1\r\n$4\r\nPING\r");
+    assert(parser.next_command(cmd) == false);
+    parser.feed("\n");
+    assert(parser.next_command(cmd) == true);
+    assert(cmd.size() == 1 && cmd[0] == "PING");
+
+    // Multiple pipelined commands in one buffer
+    parser.feed("*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n");
+    for (int i = 0; i < 3; ++i) {
+        assert(parser.next_command(cmd) == true);
+        assert(cmd[0] == "PING");
+    }
+    assert(parser.next_command(cmd) == false);
+
+    // Writer checks
+    assert(redis::RespWriter::status("OK") == "+OK\r\n");
+    assert(redis::RespWriter::integer(42) == ":42\r\n");
+    assert(redis::RespWriter::bulk("hi") == "$2\r\nhi\r\n");
+    assert(redis::RespWriter::null_bulk() == "$-1\r\n");
 }
 
-void testEviction() {
-    redis::EvictionEngine engine(redis::EvictionPolicy::AllKeysLFU);
+void test_evict() {
+    redis::Evictor evictor(redis::EvictPolicy::AllKeysLFU);
 
-    redis::DictEntry e1("k1", "v1");
-    redis::DictEntry e2("k2", "v2");
-    redis::DictEntry e3("k3", "v3");
+    redis::Entry e1("k1", "v1");
+    redis::Entry e2("k2", "v2");
+    redis::Entry e3("k3", "v3");
 
-    engine.onKeyInserted(&e1);
-    engine.onKeyInserted(&e2);
-    engine.onKeyInserted(&e3);
+    evictor.on_insert(&e1);
+    evictor.on_insert(&e2);
+    evictor.on_insert(&e3);
 
-    engine.onKeyAccessed(&e1);
-    engine.onKeyAccessed(&e1);
-    engine.onKeyAccessed(&e2);
+    evictor.on_touch(&e1);
+    evictor.on_touch(&e1);
+    evictor.on_touch(&e2);
 
-    redis::ProgressiveDict dict;
+    redis::Dict dict;
     dict.set("k1", "v1");
     dict.set("k2", "v2");
     dict.set("k3", "v3");
 
-    std::string candidate = engine.selectEvictionCandidate(dict);
-    assert(candidate == "k3");
+    string victim = evictor.pick_victim(dict);
+    assert(victim == "k3");
 
-    engine.onKeyRemoved(&e3);
-    candidate = engine.selectEvictionCandidate(dict);
-    assert(candidate == "k2");
+    evictor.on_remove(&e3);
+    victim = evictor.pick_victim(dict);
+    assert(victim == "k2");
 }
 
-void testExpiration() {
-    redis::ExpirationManager expire;
-    redis::DictEntry e("temp", "val");
+void test_expire() {
+    redis::Expirer expirer;
+    redis::Entry e("temp", "val");
 
-    assert(expire.isExpired(&e) == false);
-    assert(expire.getTtlSeconds(&e) == -1);
+    assert(expirer.is_expired(&e) == false);
+    assert(expirer.ttl_sec(&e) == -1);
 
-    uint64_t now = redis::getUnixTimeMs();
-    expire.setExpire(&e, now + 10000);
-    assert(expire.isExpired(&e) == false);
-    int64_t ttl = expire.getTtlSeconds(&e);
+    uint64_t now = redis::unix_time_ms();
+    expirer.set_expire(&e, now + 10000);
+    assert(expirer.is_expired(&e) == false);
+    int64_t ttl = expirer.ttl_sec(&e);
     assert(ttl >= 9 && ttl <= 10);
 
-    expire.setExpire(&e, now - 1000);
-    assert(expire.isExpired(&e) == true);
-    assert(expire.getTtlSeconds(&e) == -2);
+    expirer.set_expire(&e, now - 1000);
+    assert(expirer.is_expired(&e) == true);
+    assert(expirer.ttl_sec(&e) == -2);
 }
 
 int main() {
-    testUtils();
-    std::cout << "[PASS] Utils" << std::endl;
+    test_common();
+    cout << "[PASS] Common" << endl;
 
-    testDict();
-    std::cout << "[PASS] Progressive Dict" << std::endl;
+    test_dict();
+    cout << "[PASS] Dict" << endl;
 
-    testSkipList();
-    std::cout << "[PASS] SkipList & SortedSet" << std::endl;
+    test_skiplist();
+    cout << "[PASS] SkipList & ZSet" << endl;
 
-    testResp();
-    std::cout << "[PASS] RESP2 Parser & Serializer" << std::endl;
+    test_resp_parser_framing();
+    cout << "[PASS] RESP2 Parser & Framing (partial reads, split CRLF, pipeline)" << endl;
 
-    testEviction();
-    std::cout << "[PASS] Eviction Engine" << std::endl;
+    test_evict();
+    cout << "[PASS] Evictor (LFU & LRU)" << endl;
 
-    testExpiration();
-    std::cout << "[PASS] Expiration Manager" << std::endl;
+    test_expire();
+    cout << "[PASS] Expirer" << endl;
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY!" << std::endl;
+    cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY!" << endl;
     return 0;
 }

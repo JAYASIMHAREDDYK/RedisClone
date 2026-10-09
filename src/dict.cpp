@@ -1,39 +1,40 @@
 #include "dict.h"
-#include "util.h"
+#include "common.h"
 #include <cstdlib>
-#include <cstring>
 #include <random>
+
+using std::string;
+using std::string_view;
+using std::function;
 
 namespace redis {
 
-DictEntry::DictEntry(std::string k, DictValue v)
-    : key(std::move(k)), value(std::move(v)), last_accessed_time(getUnixTimeSec()) {}
+Entry::Entry(string k, Value v)
+    : key(std::move(k)), value(std::move(v)), last_accessed_time(unix_time_sec()) {}
 
-ProgressiveDict::ProgressiveDict() {
-    ht[0] = DictTable{};
-    ht[1] = DictTable{};
+Dict::Dict() {
+    ht[0] = Table{};
+    ht[1] = Table{};
     rehashidx = -1;
 }
 
-ProgressiveDict::~ProgressiveDict() {
+Dict::~Dict() {
     clear();
 }
 
-size_t ProgressiveDict::nextPowerOf2(size_t size) {
+size_t Dict::next_pow2(size_t size) {
     if (size <= 4) return 4;
     size_t p = 1;
-    while (p < size) {
-        p <<= 1;
-    }
+    while (p < size) p <<= 1;
     return p;
 }
 
-void ProgressiveDict::freeTable(DictTable& t) {
+void Dict::free_table(Table& t) {
     if (!t.table) return;
     for (size_t i = 0; i < t.size; ++i) {
-        DictEntry* curr = t.table[i];
+        Entry* curr = t.table[i];
         while (curr) {
-            DictEntry* next = curr->next;
+            Entry* next = curr->next;
             delete curr;
             curr = next;
         }
@@ -45,21 +46,21 @@ void ProgressiveDict::freeTable(DictTable& t) {
     t.used = 0;
 }
 
-void ProgressiveDict::clear() {
-    freeTable(ht[0]);
-    freeTable(ht[1]);
+void Dict::clear() {
+    free_table(ht[0]);
+    free_table(ht[1]);
     rehashidx = -1;
 }
 
-void ProgressiveDict::resize(size_t new_size) {
-    if (isRehashing() || ht[0].used > new_size) return;
-    new_size = nextPowerOf2(new_size);
+void Dict::resize(size_t new_size) {
+    if (is_rehashing() || ht[0].used > new_size) return;
+    new_size = next_pow2(new_size);
 
-    DictTable new_table;
+    Table new_table;
     new_table.size = new_size;
     new_table.sizemask = new_size - 1;
     new_table.used = 0;
-    new_table.table = static_cast<DictEntry**>(calloc(new_size, sizeof(DictEntry*)));
+    new_table.table = static_cast<Entry**>(calloc(new_size, sizeof(Entry*)));
 
     if (!ht[0].table) {
         ht[0] = new_table;
@@ -70,8 +71,8 @@ void ProgressiveDict::resize(size_t new_size) {
     rehashidx = 0;
 }
 
-void ProgressiveDict::expandIfNeeded() {
-    if (isRehashing()) return;
+void Dict::expand_if_needed() {
+    if (is_rehashing()) return;
     if (ht[0].size == 0) {
         resize(4);
         return;
@@ -81,8 +82,8 @@ void ProgressiveDict::expandIfNeeded() {
     }
 }
 
-void ProgressiveDict::stepRehash(int n) {
-    if (!isRehashing()) return;
+void Dict::step_rehash(int n) {
+    if (!is_rehashing()) return;
 
     while (n-- && ht[0].used != 0) {
         while (rehashidx < static_cast<int64_t>(ht[0].size) && ht[0].table[rehashidx] == nullptr) {
@@ -93,10 +94,10 @@ void ProgressiveDict::stepRehash(int n) {
             break;
         }
 
-        DictEntry* curr = ht[0].table[rehashidx];
+        Entry* curr = ht[0].table[rehashidx];
         while (curr) {
-            DictEntry* next = curr->next;
-            size_t idx = hashKey(curr->key) & ht[1].sizemask;
+            Entry* next = curr->next;
+            size_t idx = hash_key(curr->key) & ht[1].sizemask;
             curr->next = ht[1].table[idx];
             ht[1].table[idx] = curr;
             ht[0].used--;
@@ -110,42 +111,43 @@ void ProgressiveDict::stepRehash(int n) {
     if (ht[0].used == 0) {
         free(ht[0].table);
         ht[0] = ht[1];
-        ht[1] = DictTable{};
+        ht[1] = Table{};
         rehashidx = -1;
     }
 }
 
-void ProgressiveDict::rehashMilliseconds(int ms) {
-    uint64_t start = getMonotonicTimeMs();
-    while (isRehashing()) {
-        stepRehash(100);
-        if (static_cast<int>(getMonotonicTimeMs() - start) >= ms) {
+void Dict::rehash_ms(int ms) {
+    uint64_t start = monotonic_time_ms();
+    while (is_rehashing()) {
+        step_rehash(100);
+        if (static_cast<int>(monotonic_time_ms() - start) >= ms) {
             break;
         }
     }
 }
 
-bool ProgressiveDict::set(const std::string& key, DictValue val) {
-    if (isRehashing()) {
-        stepRehash(1);
+bool Dict::set(const string& key, Value val) {
+    if (is_rehashing()) {
+        step_rehash(1);
     }
 
-    DictEntry* existing = find(key);
+    Entry* existing = find(key);
     if (existing) {
         existing->value = std::move(val);
-        existing->last_accessed_time = getUnixTimeSec();
+        existing->last_accessed_time = unix_time_sec();
         if (existing->frequency < 0xFFFFFFFF) {
             existing->frequency++;
         }
         return false;
     }
 
-    expandIfNeeded();
+    expand_if_needed();
 
-    DictTable* target = isRehashing() ? &ht[1] : &ht[0];
-    size_t idx = hashKey(key) & target->sizemask;
+    // New keys are placed into ht[1] during rehash so ht[0] continuously drains
+    Table* target = is_rehashing() ? &ht[1] : &ht[0];
+    size_t idx = hash_key(key) & target->sizemask;
 
-    auto* entry = new DictEntry(key, std::move(val));
+    auto* entry = new Entry(key, std::move(val));
     entry->next = target->table[idx];
     target->table[idx] = entry;
     target->used++;
@@ -153,47 +155,47 @@ bool ProgressiveDict::set(const std::string& key, DictValue val) {
     return true;
 }
 
-DictEntry* ProgressiveDict::find(std::string_view key) {
+Entry* Dict::find(string_view key) {
     if (ht[0].size == 0) return nullptr;
 
-    if (isRehashing()) {
-        stepRehash(1);
+    if (is_rehashing()) {
+        step_rehash(1);
     }
 
-    uint64_t h = hashKey(key);
+    uint64_t h = hash_key(key);
     for (int table_idx = 0; table_idx <= 1; ++table_idx) {
-        DictTable& t = ht[table_idx];
+        Table& t = ht[table_idx];
         if (t.size == 0) break;
 
         size_t idx = h & t.sizemask;
-        DictEntry* curr = t.table[idx];
+        Entry* curr = t.table[idx];
         while (curr) {
             if (curr->key == key) {
                 return curr;
             }
             curr = curr->next;
         }
-        if (!isRehashing()) break;
+        if (!is_rehashing()) break;
     }
 
     return nullptr;
 }
 
-bool ProgressiveDict::erase(std::string_view key) {
+bool Dict::erase(string_view key) {
     if (ht[0].size == 0) return false;
 
-    if (isRehashing()) {
-        stepRehash(1);
+    if (is_rehashing()) {
+        step_rehash(1);
     }
 
-    uint64_t h = hashKey(key);
+    uint64_t h = hash_key(key);
     for (int table_idx = 0; table_idx <= 1; ++table_idx) {
-        DictTable& t = ht[table_idx];
+        Table& t = ht[table_idx];
         if (t.size == 0) break;
 
         size_t idx = h & t.sizemask;
-        DictEntry* curr = t.table[idx];
-        DictEntry* prev = nullptr;
+        Entry* curr = t.table[idx];
+        Entry* prev = nullptr;
 
         while (curr) {
             if (curr->key == key) {
@@ -210,27 +212,27 @@ bool ProgressiveDict::erase(std::string_view key) {
             curr = curr->next;
         }
 
-        if (!isRehashing()) break;
+        if (!is_rehashing()) break;
     }
 
     return false;
 }
 
-DictEntry* ProgressiveDict::getRandomEntry() {
+Entry* Dict::random_entry() {
     if (size() == 0) return nullptr;
 
-    if (isRehashing()) {
-        stepRehash(1);
+    if (is_rehashing()) {
+        step_rehash(1);
     }
 
     static thread_local std::mt19937_64 rng(42);
 
     int table_idx = 0;
-    if (isRehashing() && ht[1].used > 0) {
+    if (is_rehashing() && ht[1].used > 0) {
         table_idx = (rng() % (ht[0].used + ht[1].used) >= ht[0].used) ? 1 : 0;
     }
 
-    DictTable& t = ht[table_idx];
+    Table& t = ht[table_idx];
     if (t.size == 0 || t.used == 0) {
         if (table_idx == 0 && ht[1].used > 0) {
             t = ht[1];
@@ -242,10 +244,10 @@ DictEntry* ProgressiveDict::getRandomEntry() {
     size_t start_idx = rng() % t.size;
     for (size_t i = 0; i < t.size; ++i) {
         size_t idx = (start_idx + i) & t.sizemask;
-        DictEntry* curr = t.table[idx];
+        Entry* curr = t.table[idx];
         if (curr) {
             size_t count = 0;
-            for (DictEntry* p = curr; p; p = p->next) count++;
+            for (Entry* p = curr; p; p = p->next) count++;
             size_t pick = rng() % count;
             for (size_t j = 0; j < pick; ++j) curr = curr->next;
             return curr;
@@ -255,19 +257,19 @@ DictEntry* ProgressiveDict::getRandomEntry() {
     return nullptr;
 }
 
-void ProgressiveDict::forEach(const std::function<void(DictEntry*)>& callback) {
+void Dict::scan(const function<void(Entry*)>& callback) {
     for (int t = 0; t <= 1; ++t) {
         if (ht[t].table) {
             for (size_t i = 0; i < ht[t].size; ++i) {
-                DictEntry* curr = ht[t].table[i];
+                Entry* curr = ht[t].table[i];
                 while (curr) {
-                    DictEntry* next = curr->next;
+                    Entry* next = curr->next;
                     callback(curr);
                     curr = next;
                 }
             }
         }
-        if (!isRehashing()) break;
+        if (!is_rehashing()) break;
     }
 }
 

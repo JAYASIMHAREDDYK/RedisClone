@@ -1,44 +1,49 @@
 #include "server.h"
-#include "util.h"
+#include "common.h"
 #include <sstream>
-#include <iostream>
 #include <iomanip>
+
+using std::string;
+using std::vector;
+using std::shared_ptr;
+using std::make_shared;
+using std::optional;
 
 namespace redis {
 
-Server::Server(ServerConfig config)
+Server::Server(Config config)
     : config_(std::move(config)),
       eviction_(config_.eviction_policy),
       aof_(config_.aof_filename, config_.aof_fsync),
-      reactor_(config_.bind_ip, config_.port) {
-    stats_.start_time_sec = getUnixTimeSec();
-    reactor_.setIdleTimeout(config_.client_timeout);
+      loop_(config_.bind_ip, config_.port) {
+    stats_.start_time_sec = unix_time_sec();
+    loop_.set_idle_timeout(config_.client_timeout);
 }
 
 Server::~Server() {
     stop();
 }
 
-size_t Server::estimateEntrySize(const std::string& key, const DictValue& value) {
-    size_t sz = sizeof(DictEntry) + key.capacity();
-    if (std::holds_alternative<std::string>(value)) {
-        sz += std::get<std::string>(value).capacity();
-    } else if (std::holds_alternative<std::shared_ptr<SortedSet>>(value)) {
-        auto zset = std::get<std::shared_ptr<SortedSet>>(value);
+size_t Server::estimate_size(const string& key, const Value& value) {
+    size_t sz = sizeof(Entry) + key.capacity();
+    if (std::holds_alternative<string>(value)) {
+        sz += std::get<string>(value).capacity();
+    } else if (std::holds_alternative<shared_ptr<ZSet>>(value)) {
+        auto zset = std::get<shared_ptr<ZSet>>(value);
         if (zset) {
-            sz += sizeof(SortedSet) + (zset->size() * (sizeof(SkipListNode) + 64));
+            sz += sizeof(ZSet) + (zset->size() * (sizeof(SkipNode) + 64));
         }
     }
     return sz;
 }
 
-bool Server::deleteKeyInternal(const std::string& key) {
-    DictEntry* entry = dict_.find(key);
+bool Server::del_key(const string& key) {
+    Entry* entry = dict_.find(key);
     if (!entry) return false;
 
-    size_t sz = estimateEntrySize(entry->key, entry->value);
-    eviction_.onKeyRemoved(entry);
-    expire_.clearExpire(entry);
+    size_t sz = estimate_size(entry->key, entry->value);
+    eviction_.on_remove(entry);
+    expire_.clear_expire(entry);
 
     bool ok = dict_.erase(key);
     if (ok && stats_.used_memory_bytes >= sz) {
@@ -47,418 +52,388 @@ bool Server::deleteKeyInternal(const std::string& key) {
     return ok;
 }
 
-void Server::checkEviction() {
+void Server::evict_if_needed() {
     if (config_.maxmemory == 0) return;
 
     while (stats_.used_memory_bytes > config_.maxmemory) {
-        std::string candidate = eviction_.selectEvictionCandidate(dict_);
-        if (candidate.empty()) {
-            break;
-        }
-        deleteKeyInternal(candidate);
+        string victim = eviction_.pick_victim(dict_);
+        if (victim.empty()) break;
+        del_key(victim);
     }
 }
 
-void Server::handlePeriodicTasks() {
-    expire_.activeExpireCycle(dict_, [this](const std::string& key) {
-        deleteKeyInternal(key);
+void Server::cron() {
+    expire_.sample_expired(dict_, [this](const string& key) {
+        del_key(key);
     }, 5);
 
-    if (dict_.isRehashing()) {
-        dict_.rehashMilliseconds(1);
+    if (dict_.is_rehashing()) {
+        dict_.rehash_ms(1);
     }
 
     if (config_.aof_enabled) {
-        aof_.checkBackgroundRewriteStatus();
+        aof_.check_rewrite();
     }
 }
 
-void Server::registerHandlers() {
-    reactor_.setCommandHandler([this](ClientConnection& client, const std::vector<std::string>& args) {
-        executeCommand(client, args);
+void Server::setup_handlers() {
+    loop_.on_command([this](Client& client, const vector<string>& args) {
+        execute(client, args);
     });
 
-    reactor_.setPeriodicHandler([this]() {
-        handlePeriodicTasks();
+    loop_.on_tick([this]() {
+        cron();
     });
 }
 
 bool Server::start() {
-    if (!reactor_.init()) {
-        return false;
-    }
+    if (!loop_.init()) return false;
 
-    registerHandlers();
+    setup_handlers();
 
     if (config_.aof_enabled) {
-        aof_.loadAof([this](const std::vector<std::string>& args) {
+        aof_.load([this](const vector<string>& args) {
             if (args.empty()) return;
-            ClientConnection dummy(INVALID_SOCK, "127.0.0.1", 0);
-            executeCommand(dummy, args);
+            Client dummy(INVALID_SOCK, "127.0.0.1", 0);
+            execute(dummy, args);
         });
 
-        if (!aof_.open()) {
-            return false;
-        }
+        if (!aof_.open()) return false;
     }
 
     running_ = true;
-    reactor_.run();
+    loop_.run();
     return true;
 }
 
 void Server::stop() {
     if (!running_) return;
     running_ = false;
-    reactor_.stop();
+    loop_.stop();
     if (config_.aof_enabled) {
         aof_.close();
     }
 }
 
-void Server::executeCommand(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::execute(Client& client, const vector<string>& args) {
     if (args.empty()) return;
 
     stats_.total_commands_processed++;
+    string cmd = to_upper(args[0]);
 
-    std::string cmd = toUpper(args[0]);
-
-    if (cmd == "PING") {
-        cmdPing(client, args);
-    } else if (cmd == "ECHO") {
-        cmdEcho(client, args);
-    } else if (cmd == "SET") {
-        cmdSet(client, args);
-    } else if (cmd == "GET") {
-        cmdGet(client, args);
-    } else if (cmd == "DEL") {
-        cmdDel(client, args);
-    } else if (cmd == "EXISTS") {
-        cmdExists(client, args);
-    } else if (cmd == "EXPIRE") {
-        cmdExpire(client, args);
-    } else if (cmd == "TTL") {
-        cmdTtl(client, args);
-    } else if (cmd == "ZADD") {
-        cmdZAdd(client, args);
-    } else if (cmd == "ZRANGE") {
-        cmdZRange(client, args);
-    } else if (cmd == "ZRANGEBYSCORE") {
-        cmdZRangeByScore(client, args);
-    } else if (cmd == "ZSCORE") {
-        cmdZScore(client, args);
-    } else if (cmd == "ZCARD") {
-        cmdZCard(client, args);
-    } else if (cmd == "BGREWRITEAOF") {
-        cmdBgRewriteAof(client, args);
-    } else if (cmd == "INFO") {
-        cmdInfo(client, args);
-    } else if (cmd == "COMMAND") {
-        cmdCommand(client, args);
-    } else {
-        client.appendWrite(RespEncoder::error("unknown command '" + args[0] + "'"));
-    }
+    if (cmd == "PING") cmd_ping(client, args);
+    else if (cmd == "ECHO") cmd_echo(client, args);
+    else if (cmd == "SET") cmd_set(client, args);
+    else if (cmd == "GET") cmd_get(client, args);
+    else if (cmd == "DEL") cmd_del(client, args);
+    else if (cmd == "EXISTS") cmd_exists(client, args);
+    else if (cmd == "EXPIRE") cmd_expire(client, args);
+    else if (cmd == "TTL") cmd_ttl(client, args);
+    else if (cmd == "ZADD") cmd_zadd(client, args);
+    else if (cmd == "ZRANGE") cmd_zrange(client, args);
+    else if (cmd == "ZRANGEBYSCORE") cmd_zrangebyscore(client, args);
+    else if (cmd == "ZSCORE") cmd_zscore(client, args);
+    else if (cmd == "ZCARD") cmd_zcard(client, args);
+    else if (cmd == "BGREWRITEAOF") cmd_bgrewriteaof(client, args);
+    else if (cmd == "INFO") cmd_info(client, args);
+    else if (cmd == "COMMAND") cmd_command(client, args);
+    else client.write(RespWriter::error("unknown command '" + args[0] + "'"));
 }
 
-void Server::cmdPing(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_ping(Client& client, const vector<string>& args) {
     if (args.size() == 1) {
-        client.appendWrite(RespEncoder::pong());
+        client.write(RespWriter::pong());
     } else if (args.size() == 2) {
-        client.appendWrite(RespEncoder::bulkString(args[1]));
+        client.write(RespWriter::bulk(args[1]));
     } else {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'ping' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'ping' command"));
     }
 }
 
-void Server::cmdEcho(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_echo(Client& client, const vector<string>& args) {
     if (args.size() != 2) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'echo' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'echo' command"));
         return;
     }
-    client.appendWrite(RespEncoder::bulkString(args[1]));
+    client.write(RespWriter::bulk(args[1]));
 }
 
-void Server::cmdSet(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_set(Client& client, const vector<string>& args) {
     if (args.size() < 3) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'set' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'set' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    const std::string& val = args[2];
-    std::optional<int64_t> ex_seconds;
+    const string& key = args[1];
+    const string& val = args[2];
+    optional<int64_t> ex_seconds;
 
     if (args.size() > 3) {
         for (size_t i = 3; i < args.size(); ++i) {
-            std::string opt = toUpper(args[i]);
+            string opt = to_upper(args[i]);
             if (opt == "EX" && i + 1 < args.size()) {
-                auto parsed = parseInteger(args[++i]);
+                auto parsed = parse_int(args[++i]);
                 if (!parsed || *parsed <= 0) {
-                    client.appendWrite(RespEncoder::error("value is not an integer or out of range"));
+                    client.write(RespWriter::error("value is not an integer or out of range"));
                     return;
                 }
                 ex_seconds = *parsed;
             } else {
-                client.appendWrite(RespEncoder::error("syntax error"));
+                client.write(RespWriter::error("syntax error"));
                 return;
             }
         }
     }
 
-    if (config_.maxmemory > 0 && config_.eviction_policy == EvictionPolicy::NoEviction) {
+    if (config_.maxmemory > 0 && config_.eviction_policy == EvictPolicy::NoEviction) {
         if (stats_.used_memory_bytes > config_.maxmemory) {
-            client.appendWrite(RespEncoder::customError("OOM", "command not allowed when used memory > 'maxmemory'"));
+            client.write(RespWriter::error_with_code("OOM", "command not allowed when used memory > 'maxmemory'"));
             return;
         }
     }
 
-    DictEntry* old_entry = dict_.find(key);
+    Entry* old_entry = dict_.find(key);
     if (old_entry) {
-        deleteKeyInternal(key);
+        del_key(key);
     }
 
     dict_.set(key, val);
-    DictEntry* new_entry = dict_.find(key);
+    Entry* new_entry = dict_.find(key);
     if (new_entry) {
-        stats_.used_memory_bytes += estimateEntrySize(key, val);
-        eviction_.onKeyInserted(new_entry);
+        stats_.used_memory_bytes += estimate_size(key, val);
+        eviction_.on_insert(new_entry);
 
         if (ex_seconds.has_value()) {
-            uint64_t expire_at = getUnixTimeMs() + (*ex_seconds * 1000);
-            expire_.setExpire(new_entry, expire_at);
+            uint64_t expire_at = unix_time_ms() + (*ex_seconds * 1000);
+            expire_.set_expire(new_entry, expire_at);
         } else {
-            expire_.clearExpire(new_entry);
+            expire_.clear_expire(new_entry);
         }
     }
 
-    checkEviction();
+    evict_if_needed();
 
     if (config_.aof_enabled && client.fd != INVALID_SOCK) {
-        aof_.appendCommand(args);
+        aof_.append(args);
     }
 
-    client.appendWrite(RespEncoder::ok());
+    client.write(RespWriter::ok());
 }
 
-void Server::cmdGet(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_get(Client& client, const vector<string>& args) {
     if (args.size() != 2) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'get' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'get' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    DictEntry* entry = dict_.find(key);
+    const string& key = args[1];
+    Entry* entry = dict_.find(key);
 
     if (!entry) {
-        client.appendWrite(RespEncoder::nullBulkString());
+        client.write(RespWriter::null_bulk());
         return;
     }
 
-    if (expire_.isExpired(entry)) {
-        deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::nullBulkString());
+    // Passive lazy expiry
+    if (expire_.is_expired(entry)) {
+        del_key(key);
+        client.write(RespWriter::null_bulk());
         return;
     }
 
-    if (!entry->isString()) {
-        client.appendWrite(RespEncoder::customError("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
+    if (!entry->is_str()) {
+        client.write(RespWriter::error_with_code("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
         return;
     }
 
-    eviction_.onKeyAccessed(entry);
-    client.appendWrite(RespEncoder::bulkString(entry->getString()));
+    eviction_.on_touch(entry);
+    client.write(RespWriter::bulk(entry->str()));
 }
 
-void Server::cmdDel(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_del(Client& client, const vector<string>& args) {
     if (args.size() < 2) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'del' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'del' command"));
         return;
     }
 
     int64_t count = 0;
     for (size_t i = 1; i < args.size(); ++i) {
-        if (deleteKeyInternal(args[i])) {
-            count++;
-        }
+        if (del_key(args[i])) count++;
     }
 
     if (count > 0 && config_.aof_enabled && client.fd != INVALID_SOCK) {
-        aof_.appendCommand(args);
+        aof_.append(args);
     }
 
-    client.appendWrite(RespEncoder::integer(count));
+    client.write(RespWriter::integer(count));
 }
 
-void Server::cmdExists(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_exists(Client& client, const vector<string>& args) {
     if (args.size() < 2) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'exists' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'exists' command"));
         return;
     }
 
     int64_t count = 0;
     for (size_t i = 1; i < args.size(); ++i) {
-        DictEntry* entry = dict_.find(args[i]);
+        Entry* entry = dict_.find(args[i]);
         if (entry) {
-            if (expire_.isExpired(entry)) {
-                deleteKeyInternal(args[i]);
+            if (expire_.is_expired(entry)) {
+                del_key(args[i]);
             } else {
                 count++;
             }
         }
     }
 
-    client.appendWrite(RespEncoder::integer(count));
+    client.write(RespWriter::integer(count));
 }
 
-void Server::cmdExpire(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_expire(Client& client, const vector<string>& args) {
     if (args.size() != 3) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'expire' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'expire' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    auto sec = parseInteger(args[2]);
+    const string& key = args[1];
+    auto sec = parse_int(args[2]);
     if (!sec) {
-        client.appendWrite(RespEncoder::error("value is not an integer or out of range"));
+        client.write(RespWriter::error("value is not an integer or out of range"));
         return;
     }
 
-    DictEntry* entry = dict_.find(key);
-    if (!entry || expire_.isExpired(entry)) {
-        if (entry) deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::integer(0));
+    Entry* entry = dict_.find(key);
+    if (!entry || expire_.is_expired(entry)) {
+        if (entry) del_key(key);
+        client.write(RespWriter::integer(0));
         return;
     }
 
     if (*sec <= 0) {
-        deleteKeyInternal(key);
+        del_key(key);
         if (config_.aof_enabled && client.fd != INVALID_SOCK) {
-            aof_.appendCommand({"DEL", key});
+            aof_.append({"DEL", key});
         }
-        client.appendWrite(RespEncoder::integer(1));
+        client.write(RespWriter::integer(1));
         return;
     }
 
-    uint64_t expire_at = getUnixTimeMs() + (*sec * 1000);
-    expire_.setExpire(entry, expire_at);
+    uint64_t expire_at = unix_time_ms() + (*sec * 1000);
+    expire_.set_expire(entry, expire_at);
 
     if (config_.aof_enabled && client.fd != INVALID_SOCK) {
-        aof_.appendCommand(args);
+        aof_.append(args);
     }
 
-    client.appendWrite(RespEncoder::integer(1));
+    client.write(RespWriter::integer(1));
 }
 
-void Server::cmdTtl(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_ttl(Client& client, const vector<string>& args) {
     if (args.size() != 2) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'ttl' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'ttl' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    DictEntry* entry = dict_.find(key);
+    const string& key = args[1];
+    Entry* entry = dict_.find(key);
 
     if (!entry) {
-        client.appendWrite(RespEncoder::integer(-2));
+        client.write(RespWriter::integer(-2));
         return;
     }
 
-    if (expire_.isExpired(entry)) {
-        deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::integer(-2));
+    if (expire_.is_expired(entry)) {
+        del_key(key);
+        client.write(RespWriter::integer(-2));
         return;
     }
 
-    int64_t ttl = expire_.getTtlSeconds(entry);
-    client.appendWrite(RespEncoder::integer(ttl));
+    client.write(RespWriter::integer(expire_.ttl_sec(entry)));
 }
 
-void Server::cmdZAdd(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_zadd(Client& client, const vector<string>& args) {
     if (args.size() != 4) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'zadd' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'zadd' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    auto score = parseDouble(args[2]);
+    const string& key = args[1];
+    auto score = parse_double(args[2]);
     if (!score) {
-        client.appendWrite(RespEncoder::error("value is not a valid float"));
+        client.write(RespWriter::error("value is not a valid float"));
         return;
     }
-    const std::string& member = args[3];
+    const string& member = args[3];
 
-    DictEntry* entry = dict_.find(key);
-    if (entry && expire_.isExpired(entry)) {
-        deleteKeyInternal(key);
+    Entry* entry = dict_.find(key);
+    if (entry && expire_.is_expired(entry)) {
+        del_key(key);
         entry = nullptr;
     }
 
-    std::shared_ptr<SortedSet> zset;
+    shared_ptr<ZSet> zset;
     if (!entry) {
-        zset = std::make_shared<SortedSet>();
+        zset = make_shared<ZSet>();
         dict_.set(key, zset);
         entry = dict_.find(key);
         if (entry) {
-            stats_.used_memory_bytes += estimateEntrySize(key, zset);
-            eviction_.onKeyInserted(entry);
+            stats_.used_memory_bytes += estimate_size(key, zset);
+            eviction_.on_insert(entry);
         }
     } else {
-        if (!entry->isZSet()) {
-            client.appendWrite(RespEncoder::customError("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
+        if (!entry->is_zset()) {
+            client.write(RespWriter::error_with_code("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
             return;
         }
-        zset = entry->getZSet();
-        eviction_.onKeyAccessed(entry);
+        zset = entry->zset();
+        eviction_.on_touch(entry);
     }
 
     bool added = zset->add(*score, member);
 
-    checkEviction();
+    evict_if_needed();
 
     if (config_.aof_enabled && client.fd != INVALID_SOCK) {
-        aof_.appendCommand(args);
+        aof_.append(args);
     }
 
-    client.appendWrite(RespEncoder::integer(added ? 1 : 0));
+    client.write(RespWriter::integer(added ? 1 : 0));
 }
 
-void Server::cmdZRange(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_zrange(Client& client, const vector<string>& args) {
     if (args.size() < 4) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'zrange' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'zrange' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    auto start = parseInteger(args[2]);
-    auto stop = parseInteger(args[3]);
+    const string& key = args[1];
+    auto start = parse_int(args[2]);
+    auto stop = parse_int(args[3]);
 
     if (!start || !stop) {
-        client.appendWrite(RespEncoder::error("value is not an integer or out of range"));
+        client.write(RespWriter::error("value is not an integer or out of range"));
         return;
     }
 
-    bool with_scores = false;
-    if (args.size() == 5 && toUpper(args[4]) == "WITHSCORES") {
-        with_scores = true;
-    }
+    bool with_scores = (args.size() == 5 && to_upper(args[4]) == "WITHSCORES");
 
-    DictEntry* entry = dict_.find(key);
-    if (!entry || expire_.isExpired(entry)) {
-        if (entry) deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::emptyArray());
+    Entry* entry = dict_.find(key);
+    if (!entry || expire_.is_expired(entry)) {
+        if (entry) del_key(key);
+        client.write(RespWriter::empty_array());
         return;
     }
 
-    if (!entry->isZSet()) {
-        client.appendWrite(RespEncoder::customError("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
+    if (!entry->is_zset()) {
+        client.write(RespWriter::error_with_code("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
         return;
     }
 
-    eviction_.onKeyAccessed(entry);
-    auto zset = entry->getZSet();
+    eviction_.on_touch(entry);
+    auto zset = entry->zset();
     auto items = zset->range(*start, *stop, with_scores);
 
-    std::vector<std::string> output;
+    vector<string> output;
     output.reserve(items.size() * (with_scores ? 2 : 1));
     for (const auto& [member, score] : items) {
         output.push_back(member);
@@ -469,48 +444,46 @@ void Server::cmdZRange(ClientConnection& client, const std::vector<std::string>&
         }
     }
 
-    client.appendWrite(RespEncoder::array(output));
+    client.write(RespWriter::array(output));
 }
 
-void Server::cmdZRangeByScore(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_zrangebyscore(Client& client, const vector<string>& args) {
     if (args.size() < 4) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'zrangebyscore' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'zrangebyscore' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    auto min_score = parseDouble(args[2]);
-    auto max_score = parseDouble(args[3]);
+    const string& key = args[1];
+    auto min_score = parse_double(args[2]);
+    auto max_score = parse_double(args[3]);
 
     if (!min_score || !max_score) {
-        client.appendWrite(RespEncoder::error("min or max is not a float"));
+        client.write(RespWriter::error("min or max is not a float"));
         return;
     }
 
     bool with_scores = false;
     for (size_t i = 4; i < args.size(); ++i) {
-        if (toUpper(args[i]) == "WITHSCORES") {
-            with_scores = true;
-        }
+        if (to_upper(args[i]) == "WITHSCORES") with_scores = true;
     }
 
-    DictEntry* entry = dict_.find(key);
-    if (!entry || expire_.isExpired(entry)) {
-        if (entry) deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::emptyArray());
+    Entry* entry = dict_.find(key);
+    if (!entry || expire_.is_expired(entry)) {
+        if (entry) del_key(key);
+        client.write(RespWriter::empty_array());
         return;
     }
 
-    if (!entry->isZSet()) {
-        client.appendWrite(RespEncoder::customError("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
+    if (!entry->is_zset()) {
+        client.write(RespWriter::error_with_code("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
         return;
     }
 
-    eviction_.onKeyAccessed(entry);
-    auto zset = entry->getZSet();
-    auto items = zset->rangeByScore(*min_score, *max_score, true, true, 0, -1, with_scores);
+    eviction_.on_touch(entry);
+    auto zset = entry->zset();
+    auto items = zset->range_by_score(*min_score, *max_score, true, true, 0, -1, with_scores);
 
-    std::vector<std::string> output;
+    vector<string> output;
     output.reserve(items.size() * (with_scores ? 2 : 1));
     for (const auto& [member, score] : items) {
         output.push_back(member);
@@ -521,99 +494,98 @@ void Server::cmdZRangeByScore(ClientConnection& client, const std::vector<std::s
         }
     }
 
-    client.appendWrite(RespEncoder::array(output));
+    client.write(RespWriter::array(output));
 }
 
-void Server::cmdZScore(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_zscore(Client& client, const vector<string>& args) {
     if (args.size() != 3) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'zscore' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'zscore' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    const std::string& member = args[2];
+    const string& key = args[1];
+    const string& member = args[2];
 
-    DictEntry* entry = dict_.find(key);
-    if (!entry || expire_.isExpired(entry)) {
-        if (entry) deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::nullBulkString());
+    Entry* entry = dict_.find(key);
+    if (!entry || expire_.is_expired(entry)) {
+        if (entry) del_key(key);
+        client.write(RespWriter::null_bulk());
         return;
     }
 
-    if (!entry->isZSet()) {
-        client.appendWrite(RespEncoder::customError("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
+    if (!entry->is_zset()) {
+        client.write(RespWriter::error_with_code("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
         return;
     }
 
-    eviction_.onKeyAccessed(entry);
-    auto zset = entry->getZSet();
-    auto score = zset->getScore(member);
+    eviction_.on_touch(entry);
+    auto zset = entry->zset();
+    auto score = zset->score_of(member);
 
     if (!score) {
-        client.appendWrite(RespEncoder::nullBulkString());
+        client.write(RespWriter::null_bulk());
         return;
     }
 
     std::ostringstream ss;
     ss << std::setprecision(15) << *score;
-    client.appendWrite(RespEncoder::bulkString(ss.str()));
+    client.write(RespWriter::bulk(ss.str()));
 }
 
-void Server::cmdZCard(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_zcard(Client& client, const vector<string>& args) {
     if (args.size() != 2) {
-        client.appendWrite(RespEncoder::error("wrong number of arguments for 'zcard' command"));
+        client.write(RespWriter::error("wrong number of arguments for 'zcard' command"));
         return;
     }
 
-    const std::string& key = args[1];
-    DictEntry* entry = dict_.find(key);
+    const string& key = args[1];
+    Entry* entry = dict_.find(key);
 
-    if (!entry || expire_.isExpired(entry)) {
-        if (entry) deleteKeyInternal(key);
-        client.appendWrite(RespEncoder::integer(0));
+    if (!entry || expire_.is_expired(entry)) {
+        if (entry) del_key(key);
+        client.write(RespWriter::integer(0));
         return;
     }
 
-    if (!entry->isZSet()) {
-        client.appendWrite(RespEncoder::customError("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
+    if (!entry->is_zset()) {
+        client.write(RespWriter::error_with_code("WRONGTYPE", "Operation against a key holding the wrong kind of value"));
         return;
     }
 
-    eviction_.onKeyAccessed(entry);
-    auto zset = entry->getZSet();
-    client.appendWrite(RespEncoder::integer(static_cast<int64_t>(zset->size())));
+    eviction_.on_touch(entry);
+    auto zset = entry->zset();
+    client.write(RespWriter::integer(static_cast<int64_t>(zset->size())));
 }
 
-void Server::cmdBgRewriteAof(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_bgrewriteaof(Client& client, const vector<string>& args) {
     (void)args;
     if (!config_.aof_enabled) {
-        client.appendWrite(RespEncoder::error("AOF is disabled"));
+        client.write(RespWriter::error("AOF is disabled"));
         return;
     }
 
-    if (aof_.isRewriteInProgress()) {
-        client.appendWrite(RespEncoder::error("Background append only file rewriting already in progress"));
+    if (aof_.is_rewriting()) {
+        client.write(RespWriter::error("Background append only file rewriting already in progress"));
         return;
     }
 
-    bool started = aof_.startBackgroundRewrite(dict_);
-    if (started) {
-        client.appendWrite(RespEncoder::simpleString("Background append only file rewriting started"));
+    if (aof_.rewrite_bg(dict_)) {
+        client.write(RespWriter::status("Background append only file rewriting started"));
     } else {
-        client.appendWrite(RespEncoder::error("Unable to start background rewrite"));
+        client.write(RespWriter::error("Unable to start background rewrite"));
     }
 }
 
-void Server::cmdInfo(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_info(Client& client, const vector<string>& args) {
     (void)args;
-    uint32_t uptime = getUnixTimeSec() - static_cast<uint32_t>(stats_.start_time_sec);
+    uint32_t uptime = unix_time_sec() - static_cast<uint32_t>(stats_.start_time_sec);
 
     std::ostringstream ss;
     ss << "# Server\r\n";
     ss << "redis_version:7.0.0-clone\r\n";
     ss << "uptime_in_seconds:" << uptime << "\r\n";
     ss << "# Clients\r\n";
-    ss << "connected_clients:" << reactor_.activeClientsCount() << "\r\n";
+    ss << "connected_clients:" << loop_.client_count() << "\r\n";
     ss << "# Memory\r\n";
     ss << "used_memory:" << stats_.used_memory_bytes.load() << "\r\n";
     ss << "maxmemory:" << config_.maxmemory << "\r\n";
@@ -621,17 +593,17 @@ void Server::cmdInfo(ClientConnection& client, const std::vector<std::string>& a
     ss << "total_commands_processed:" << stats_.total_commands_processed.load() << "\r\n";
     ss << "# Persistence\r\n";
     ss << "aof_enabled:" << (config_.aof_enabled ? 1 : 0) << "\r\n";
-    ss << "aof_rewrite_in_progress:" << (aof_.isRewriteInProgress() ? 1 : 0) << "\r\n";
-    ss << "aof_current_size:" << aof_.getFileSize() << "\r\n";
+    ss << "aof_rewrite_in_progress:" << (aof_.is_rewriting() ? 1 : 0) << "\r\n";
+    ss << "aof_current_size:" << aof_.size() << "\r\n";
     ss << "# Keyspace\r\n";
-    ss << "db0:keys=" << dict_.size() << ",expires=" << expire_.expiringKeysCount() << "\r\n";
+    ss << "db0:keys=" << dict_.size() << ",expires=" << expire_.size() << "\r\n";
 
-    client.appendWrite(RespEncoder::bulkString(ss.str()));
+    client.write(RespWriter::bulk(ss.str()));
 }
 
-void Server::cmdCommand(ClientConnection& client, const std::vector<std::string>& args) {
+void Server::cmd_command(Client& client, const vector<string>& args) {
     (void)args;
-    client.appendWrite(RespEncoder::emptyArray());
+    client.write(RespWriter::empty_array());
 }
 
 }

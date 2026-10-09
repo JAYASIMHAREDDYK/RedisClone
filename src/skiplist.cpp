@@ -1,15 +1,19 @@
 #include "skiplist.h"
 #include <random>
-#include <cmath>
 #include <algorithm>
+
+using std::string;
+using std::vector;
+using std::pair;
+using std::optional;
 
 namespace redis {
 
-SkipListNode::SkipListNode(int lvl, double s, std::string m)
+SkipNode::SkipNode(int lvl, double s, string m)
     : member(std::move(m)), score(s), level(lvl) {}
 
 SkipList::SkipList() {
-    header = new SkipListNode(SKIPLIST_MAXLEVEL, 0.0, "");
+    header = new SkipNode(SKIPLIST_MAXLEVEL, 0.0, "");
     for (int i = 0; i < SKIPLIST_MAXLEVEL; ++i) {
         header->level[i].forward = nullptr;
         header->level[i].span = 0;
@@ -50,7 +54,7 @@ SkipList& SkipList::operator=(SkipList&& other) noexcept {
     return *this;
 }
 
-int SkipList::randomLevel() {
+int SkipList::random_level() {
     static thread_local std::mt19937 gen(1337);
     static thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
 
@@ -61,10 +65,10 @@ int SkipList::randomLevel() {
     return lvl;
 }
 
-SkipListNode* SkipList::insert(double score, const std::string& member) {
-    SkipListNode* update[SKIPLIST_MAXLEVEL];
+SkipNode* SkipList::insert(double score, const string& member) {
+    SkipNode* update[SKIPLIST_MAXLEVEL];
     uint32_t rank[SKIPLIST_MAXLEVEL];
-    SkipListNode* x = header;
+    SkipNode* x = header;
 
     for (int i = max_level - 1; i >= 0; --i) {
         rank[i] = (i == max_level - 1) ? 0 : rank[i + 1];
@@ -77,7 +81,7 @@ SkipListNode* SkipList::insert(double score, const std::string& member) {
         update[i] = x;
     }
 
-    int lvl = randomLevel();
+    int lvl = random_level();
     if (lvl > max_level) {
         for (int i = max_level; i < lvl; ++i) {
             rank[i] = 0;
@@ -87,7 +91,7 @@ SkipListNode* SkipList::insert(double score, const std::string& member) {
         max_level = lvl;
     }
 
-    x = new SkipListNode(lvl, score, member);
+    x = new SkipNode(lvl, score, member);
     for (int i = 0; i < lvl; ++i) {
         x->level[i].forward = update[i]->level[i].forward;
         update[i]->level[i].forward = x;
@@ -111,9 +115,9 @@ SkipListNode* SkipList::insert(double score, const std::string& member) {
     return x;
 }
 
-bool SkipList::erase(double score, const std::string& member) {
-    SkipListNode* update[SKIPLIST_MAXLEVEL];
-    SkipListNode* x = header;
+bool SkipList::erase(double score, const string& member) {
+    SkipNode* update[SKIPLIST_MAXLEVEL];
+    SkipNode* x = header;
 
     for (int i = max_level - 1; i >= 0; --i) {
         while (x->level[i].forward &&
@@ -152,9 +156,9 @@ bool SkipList::erase(double score, const std::string& member) {
     return false;
 }
 
-uint32_t SkipList::getRank(double score, const std::string& member) const {
+uint32_t SkipList::rank_of(double score, const string& member) const {
     uint32_t rank = 0;
-    SkipListNode* x = header;
+    SkipNode* x = header;
 
     for (int i = max_level - 1; i >= 0; --i) {
         while (x->level[i].forward &&
@@ -170,11 +174,11 @@ uint32_t SkipList::getRank(double score, const std::string& member) const {
     return 0;
 }
 
-SkipListNode* SkipList::getNodeByRank(uint32_t rank) const {
+SkipNode* SkipList::node_at_rank(uint32_t rank) const {
     if (rank == 0 || rank > length) return nullptr;
 
     uint32_t traversed = 0;
-    SkipListNode* x = header;
+    SkipNode* x = header;
 
     for (int i = max_level - 1; i >= 0; --i) {
         while (x->level[i].forward && traversed + x->level[i].span <= rank) {
@@ -188,11 +192,11 @@ SkipListNode* SkipList::getNodeByRank(uint32_t rank) const {
     return nullptr;
 }
 
-SkipListNode* SkipList::getFirstInRange(double min_score, double max_score, 
-                                        bool min_inclusive, bool max_inclusive) const {
+SkipNode* SkipList::first_in_range(double min_score, double max_score, 
+                                   bool min_inclusive, bool max_inclusive) const {
     if (length == 0) return nullptr;
 
-    SkipListNode* x = header;
+    SkipNode* x = header;
     for (int i = max_level - 1; i >= 0; --i) {
         while (x->level[i].forward) {
             double next_score = x->level[i].forward->score;
@@ -216,9 +220,9 @@ SkipListNode* SkipList::getFirstInRange(double min_score, double max_score,
 
 void SkipList::clear() {
     if (!header) return;
-    SkipListNode* curr = header->level[0].forward;
+    SkipNode* curr = header->level[0].forward;
     while (curr) {
-        SkipListNode* next = curr->level[0].forward;
+        SkipNode* next = curr->level[0].forward;
         delete curr;
         curr = next;
     }
@@ -231,7 +235,7 @@ void SkipList::clear() {
     max_level = 1;
 }
 
-bool SortedSet::add(double score, const std::string& member) {
+bool ZSet::add(double score, const string& member) {
     auto it = dict.find(member);
     if (it != dict.end()) {
         if (it->second == score) {
@@ -248,7 +252,7 @@ bool SortedSet::add(double score, const std::string& member) {
     return true;
 }
 
-bool SortedSet::remove(const std::string& member) {
+bool ZSet::remove(const string& member) {
     auto it = dict.find(member);
     if (it == dict.end()) {
         return false;
@@ -258,7 +262,7 @@ bool SortedSet::remove(const std::string& member) {
     return true;
 }
 
-std::optional<double> SortedSet::getScore(const std::string& member) const {
+optional<double> ZSet::score_of(const string& member) const {
     auto it = dict.find(member);
     if (it != dict.end()) {
         return it->second;
@@ -266,21 +270,22 @@ std::optional<double> SortedSet::getScore(const std::string& member) const {
     return std::nullopt;
 }
 
-std::optional<uint32_t> SortedSet::getRank(const std::string& member) const {
+optional<uint32_t> ZSet::rank_of(const string& member) const {
     auto it = dict.find(member);
     if (it == dict.end()) {
         return std::nullopt;
     }
-    uint32_t rank = skiplist.getRank(it->second, member);
-    if (rank > 0) {
-        return rank - 1;
+    // rank_of returns 1-indexed rank; return 0-indexed rank for Redis ZRANK
+    uint32_t r = skiplist.rank_of(it->second, member);
+    if (r > 0) {
+        return r - 1;
     }
     return std::nullopt;
 }
 
-std::vector<std::pair<std::string, double>> SortedSet::range(int64_t start, int64_t stop, bool with_scores) const {
+vector<pair<string, double>> ZSet::range(int64_t start, int64_t stop, bool with_scores) const {
     (void)with_scores;
-    std::vector<std::pair<std::string, double>> result;
+    vector<pair<string, double>> result;
     int64_t total = static_cast<int64_t>(skiplist.length);
     if (total == 0) return result;
 
@@ -292,7 +297,7 @@ std::vector<std::pair<std::string, double>> SortedSet::range(int64_t start, int6
     if (stop >= total) stop = total - 1;
 
     uint32_t current_rank = static_cast<uint32_t>(start + 1);
-    SkipListNode* node = skiplist.getNodeByRank(current_rank);
+    SkipNode* node = skiplist.node_at_rank(current_rank);
     int64_t count = stop - start + 1;
 
     while (node && count-- > 0) {
@@ -303,16 +308,16 @@ std::vector<std::pair<std::string, double>> SortedSet::range(int64_t start, int6
     return result;
 }
 
-std::vector<std::pair<std::string, double>> SortedSet::rangeByScore(
+vector<pair<string, double>> ZSet::range_by_score(
     double min_score, double max_score, 
     bool min_inclusive, bool max_inclusive,
     int64_t offset, int64_t count,
     bool with_scores) const {
     (void)with_scores;
-    std::vector<std::pair<std::string, double>> result;
+    vector<pair<string, double>> result;
     if (skiplist.length == 0) return result;
 
-    SkipListNode* node = skiplist.getFirstInRange(min_score, max_score, min_inclusive, max_inclusive);
+    SkipNode* node = skiplist.first_in_range(min_score, max_score, min_inclusive, max_inclusive);
     while (node && offset > 0) {
         offset--;
         node = node->level[0].forward;

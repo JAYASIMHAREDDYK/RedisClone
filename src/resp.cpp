@@ -1,11 +1,14 @@
 #include "resp.h"
 #include <charconv>
-#include <sstream>
+
+using std::string;
+using std::string_view;
+using std::vector;
 
 namespace redis {
 
-std::string RespEncoder::simpleString(std::string_view s) {
-    std::string out;
+string RespWriter::status(string_view s) {
+    string out;
     out.reserve(s.size() + 3);
     out.push_back('+');
     out.append(s);
@@ -13,8 +16,8 @@ std::string RespEncoder::simpleString(std::string_view s) {
     return out;
 }
 
-std::string RespEncoder::error(std::string_view msg) {
-    std::string out;
+string RespWriter::error(string_view msg) {
+    string out;
     out.reserve(msg.size() + 7);
     out.append("-ERR ");
     out.append(msg);
@@ -22,28 +25,28 @@ std::string RespEncoder::error(std::string_view msg) {
     return out;
 }
 
-std::string RespEncoder::customError(std::string_view prefix, std::string_view msg) {
-    std::string out;
-    out.reserve(prefix.size() + msg.size() + 4);
+string RespWriter::error_with_code(string_view code, string_view msg) {
+    string out;
+    out.reserve(code.size() + msg.size() + 4);
     out.push_back('-');
-    out.append(prefix);
+    out.append(code);
     out.push_back(' ');
     out.append(msg);
     out.append("\r\n");
     return out;
 }
 
-std::string RespEncoder::integer(int64_t val) {
-    std::string out;
+string RespWriter::integer(int64_t val) {
+    string out;
     out.push_back(':');
     out.append(std::to_string(val));
     out.append("\r\n");
     return out;
 }
 
-std::string RespEncoder::bulkString(std::string_view s) {
-    std::string out;
-    std::string len_str = std::to_string(s.size());
+string RespWriter::bulk(string_view s) {
+    string out;
+    string len_str = std::to_string(s.size());
     out.reserve(1 + len_str.size() + 2 + s.size() + 2);
     out.push_back('$');
     out.append(len_str);
@@ -53,36 +56,36 @@ std::string RespEncoder::bulkString(std::string_view s) {
     return out;
 }
 
-std::string RespEncoder::nullBulkString() {
+string RespWriter::null_bulk() {
     return "$-1\r\n";
 }
 
-std::string RespEncoder::nullArray() {
+string RespWriter::null_array() {
     return "*-1\r\n";
 }
 
-std::string RespEncoder::array(const std::vector<std::string>& elements) {
-    std::string out;
-    std::string count_str = std::to_string(elements.size());
+string RespWriter::array(const vector<string>& elements) {
+    string out;
+    string count_str = std::to_string(elements.size());
     out.push_back('*');
     out.append(count_str);
     out.append("\r\n");
 
     for (const auto& elem : elements) {
-        out.append(bulkString(elem));
+        out.append(bulk(elem));
     }
     return out;
 }
 
-std::string RespEncoder::emptyArray() {
+string RespWriter::empty_array() {
     return "*0\r\n";
 }
 
-std::string RespEncoder::ok() {
+string RespWriter::ok() {
     return "+OK\r\n";
 }
 
-std::string RespEncoder::pong() {
+string RespWriter::pong() {
     return "+PONG\r\n";
 }
 
@@ -90,22 +93,11 @@ void RespParser::feed(const char* data, size_t len) {
     buffer_.append(data, len);
 }
 
-void RespParser::feed(std::string_view s) {
+void RespParser::feed(string_view s) {
     buffer_.append(s);
 }
 
-bool RespParser::hasCompleteCommand() {
-    std::vector<std::string> dummy;
-    size_t consumed = 0;
-    if (buffer_.empty()) return false;
-
-    if (buffer_[0] == '*') {
-        return parseRespArray(dummy, consumed);
-    }
-    return parseInlineCommand(dummy, consumed);
-}
-
-bool RespParser::nextCommand(std::vector<std::string>& args) {
+bool RespParser::next_command(vector<string>& args) {
     args.clear();
     if (buffer_.empty()) return false;
 
@@ -113,9 +105,9 @@ bool RespParser::nextCommand(std::vector<std::string>& args) {
     bool ok = false;
 
     if (buffer_[0] == '*') {
-        ok = parseRespArray(args, consumed);
+        ok = parse_array(args, consumed);
     } else {
-        ok = parseInlineCommand(args, consumed);
+        ok = parse_inline(args, consumed);
     }
 
     if (ok && consumed > 0) {
@@ -126,37 +118,35 @@ bool RespParser::nextCommand(std::vector<std::string>& args) {
     return false;
 }
 
-bool RespParser::parseRespArray(std::vector<std::string>& args, size_t& consumed) {
+bool RespParser::parse_array(vector<string>& args, size_t& consumed) {
     consumed = 0;
-    size_t crlf_pos = buffer_.find("\r\n");
-    if (crlf_pos == std::string::npos) {
+    size_t crlf = buffer_.find("\r\n");
+    if (crlf == string::npos) {
         return false;
     }
 
-    int64_t element_count = 0;
-    auto [p, ec] = std::from_chars(buffer_.data() + 1, buffer_.data() + crlf_pos, element_count);
-    if (ec != std::errc() || element_count < 0) {
+    int64_t count = 0;
+    auto [p, ec] = std::from_chars(buffer_.data() + 1, buffer_.data() + crlf, count);
+    if (ec != std::errc() || count < 0) {
         return false;
     }
 
-    size_t current_pos = crlf_pos + 2;
-    std::vector<std::string> parsed;
-    parsed.reserve(element_count);
+    size_t cur = crlf + 2;
+    vector<string> parsed;
+    parsed.reserve(count);
 
-    for (int64_t i = 0; i < element_count; ++i) {
-        if (current_pos >= buffer_.size()) return false;
-
-        if (buffer_[current_pos] != '$') {
+    for (int64_t i = 0; i < count; ++i) {
+        if (cur >= buffer_.size() || buffer_[cur] != '$') {
             return false;
         }
 
-        size_t next_crlf = buffer_.find("\r\n", current_pos);
-        if (next_crlf == std::string::npos) {
+        size_t next_crlf = buffer_.find("\r\n", cur);
+        if (next_crlf == string::npos) {
             return false;
         }
 
         int64_t bulk_len = 0;
-        auto [bp, bec] = std::from_chars(buffer_.data() + current_pos + 1, buffer_.data() + next_crlf, bulk_len);
+        auto [bp, bec] = std::from_chars(buffer_.data() + cur + 1, buffer_.data() + next_crlf, bulk_len);
         if (bec != std::errc() || bulk_len < 0) {
             return false;
         }
@@ -164,27 +154,23 @@ bool RespParser::parseRespArray(std::vector<std::string>& args, size_t& consumed
         size_t data_start = next_crlf + 2;
         size_t data_end = data_start + bulk_len;
 
-        if (data_end + 2 > buffer_.size()) {
-            return false;
-        }
-
-        if (buffer_[data_end] != '\r' || buffer_[data_end + 1] != '\n') {
+        if (data_end + 2 > buffer_.size() || buffer_[data_end] != '\r' || buffer_[data_end + 1] != '\n') {
             return false;
         }
 
         parsed.emplace_back(buffer_.substr(data_start, bulk_len));
-        current_pos = data_end + 2;
+        cur = data_end + 2;
     }
 
-    consumed = current_pos;
+    consumed = cur;
     args = std::move(parsed);
     return true;
 }
 
-bool RespParser::parseInlineCommand(std::vector<std::string>& args, size_t& consumed) {
+bool RespParser::parse_inline(vector<string>& args, size_t& consumed) {
     consumed = 0;
     size_t newline = buffer_.find('\n');
-    if (newline == std::string::npos) {
+    if (newline == string::npos) {
         return false;
     }
 
@@ -193,10 +179,10 @@ bool RespParser::parseInlineCommand(std::vector<std::string>& args, size_t& cons
         line_len--;
     }
 
-    std::string_view line(buffer_.data(), line_len);
+    string_view line(buffer_.data(), line_len);
     consumed = newline + 1;
 
-    std::vector<std::string> parsed;
+    vector<string> parsed;
     size_t i = 0;
     while (i < line.size()) {
         while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
