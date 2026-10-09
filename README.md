@@ -1,10 +1,105 @@
-# Networked In-Memory Key-Value Datastore (Redis Clone)
+# RedisClone
 
-A high-performance in-memory key-value storage engine engineered in C++17 speaking native RESP2 (Redis Serialization Protocol). Achieving **812,000+ operations per second** with sub-0.3 ms $p99$ tail latency under pipelined workloads and **78,000+ single-round-trip QPS** ($p50 < 0.25$ ms), the engine eliminates stop-the-world latency spikes via dual-table incremental rehashing, provides $O(\log N)$ rank operations via level-span SkipLists, and guarantees crash durability through an Append-Only File (AOF) persistence subsystem with copy-on-write background rewrites.
+In-memory key-value store in C++17 implementing the RESP2 protocol, incremental hash table rehashing, SkipList sorted sets, and append-only file persistence.
 
----
+[![CI](https://github.com/JAYASIMHAREDDYK/RedisClone/actions/workflows/ci.yml/badge.svg)](https://github.com/JAYASIMHAREDDYK/RedisClone/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/Standard-C%2B%2B17-purple.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
+[![Platform: Linux / POSIX](https://img.shields.io/badge/Platform-Linux%20%2F%20POSIX-orange.svg)]()
 
-## Architecture Diagram
+## Overview
+
+RedisClone is a standalone, single-threaded in-memory datastore engineered around a non-blocking event loop. It speaks standard RESP2 to remain compatible with existing Redis drivers and command-line utilities. Core storage relies on a dual-table progressive hash table to amortize rehashing costs across queries. Persistence is provided through an append-only file with periodic synchronization and copy-on-write background log rewriting.
+
+| Operation | Pipelined (P=16, c=50) | Unpipelined (P=1, c=50) | p50 Latency (P=16) | p99 Latency (P=16) |
+| :--- | :--- | :--- | :--- | :--- |
+| `SET` | 726,253 ops/sec | 70,289 ops/sec | 0.039 ms | 0.217 ms |
+| `GET` | 634,067 ops/sec | 74,711 ops/sec | 0.046 ms | 0.263 ms |
+| `ZADD` | 682,808 ops/sec | 73,786 ops/sec | 0.060 ms | 0.158 ms |
+| `PING` | 786,961 ops/sec | 76,246 ops/sec | 0.034 ms | 0.192 ms |
+
+Detailed measurement methodology and raw run data are documented in [docs/benchmarks.md](docs/benchmarks.md).
+
+## Features and Status
+
+| Feature Area | Component | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| Network I/O | Single-threaded Reactor | Implemented | Edge-triggered epoll on Linux; poll fallback on Windows |
+| Protocol | RESP2 Parser and Writer | Implemented | Handles bulk strings, arrays, integers, errors, partial reads |
+| Key-Value Store | Progressive Hash Table | Implemented | Dual-table progressive rehashing (1 bucket migrated per query) |
+| Sorted Sets | SkipList with Level Spans | Implemented | 32-level geometric distribution; O(log N) rank and range scans |
+| Expiration | Passive + Active Sampling | Implemented | Lazy eviction on access; 100 ms periodic sampling capped at 10 ms |
+| Eviction | O(1) LFU + Sampled LRU | Implemented | Doubly-linked frequency buckets; active on maxmemory cap |
+| Persistence | Append-Only File (AOF) | Implemented | always, everysec, and no fsync policies supported |
+| Log Compaction | Background AOF Rewrite | Implemented | fork() copy-on-write on Linux; worker snapshot fallback on Windows |
+| Clustering / Sentinel| Distributed Consensus | Not Implemented | Out of scope for standalone engine |
+
+## Quick Start
+
+### Build and Run
+
+```bash
+git clone https://github.com/JAYASIMHAREDDYK/RedisClone.git
+cd RedisClone
+make
+./redis-server -p 6379 --aof yes --fsync everysec
+```
+
+### Example Session
+
+```text
+$ redis-cli -p 6379
+127.0.0.1:6379> PING
+PONG
+127.0.0.1:6379> SET user:100 "alice" EX 60
+OK
+127.0.0.1:6379> GET user:100
+"alice"
+127.0.0.1:6379> TTL user:100
+(integer) 58
+127.0.0.1:6379> ZADD leaderboard 1500 "player_alpha"
+(integer) 1
+127.0.0.1:6379> ZADD leaderboard 2400 "player_beta"
+(integer) 1
+127.0.0.1:6379> ZRANGE leaderboard 0 -1 WITHSCORES
+1) "player_alpha"
+2) "1500"
+3) "player_beta"
+4) "2400"
+```
+
+## Supported Commands
+
+| Command | Complexity | Description / Notes |
+| :--- | :--- | :--- |
+| `PING [msg]` | O(1) | Returns PONG or echoes message argument. |
+| `ECHO msg` | O(1) | Echoes the input string. |
+| `SET key val [EX sec]` | O(1) amortized | Stores string value with optional TTL. |
+| `GET key` | O(1) amortized | Retrieves value; returns nil on missing or expired keys. |
+| `DEL key [key ...]` | O(K) | Removes specified keys and returns deleted count. |
+| `EXISTS key [key ...]`| O(K) | Checks key existence. |
+| `EXPIRE key sec` | O(1) | Sets expiration deadline in seconds. |
+| `TTL key` | O(1) | Returns remaining seconds (-2 if missing, -1 if no TTL). |
+| `ZADD key score member` | O(log N) | Adds or updates member score in sorted set. |
+| `ZRANGE key start stop [WITHSCORES]` | O(log N + M) | Range by rank using skiplist level spans. |
+| `ZRANGEBYSCORE key min max [WITHSCORES]`| O(log N + M) | Range by score. |
+| `ZSCORE key member` | O(1) | Retrieves member score via auxiliary hash map. |
+| `ZCARD key` | O(1) | Returns element count in sorted set. |
+| `BGREWRITEAOF` | O(1) trigger | Initiates background copy-on-write log compaction. |
+| `INFO` | O(1) | Returns server statistics and keyspace metrics. |
+
+## Configuration Options
+
+| Option Flag | Argument | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-p`, `--port` | `<int>` | `6379` | TCP port to listen on. |
+| `-h`, `--host` | `<string>` | `0.0.0.0` | Bind IP address. |
+| `-m`, `--maxmemory` | `<bytes>` | `0` (unlimited) | Memory ceiling before triggering eviction. |
+| `--policy` | `<name>` | `allkeys-lfu` | Eviction policy (`noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-lfu`). |
+| `--aof` | `yes` / `no` | `yes` | Enables Append-Only File durability. |
+| `--fsync` | `always` / `everysec` / `no` | `everysec` | Disk synchronization frequency policy. |
+
+## Architecture
 
 ```
                              [ Clients / SDKs / redis-cli ]
@@ -13,7 +108,6 @@ A high-performance in-memory key-value storage engine engineered in C++17 speaki
                                             v
 +-----------------------------------------------------------------------------------+
 | Network I/O Core (Single-Threaded Reactor)                                        |
-|                                                                                   |
 |   +---------------------------------------------------------------------------+   |
 |   |         Linux epoll_wait() Reactor Event Loop (Edge-Triggered / EPOLLET)  |   |
 |   +-------------------------------------+-------------------------------------+   |
@@ -35,7 +129,6 @@ A high-performance in-memory key-value storage engine engineered in C++17 speaki
                   v                                               |
 +-----------------------------------------------------------------|-----------------+
 | Command Execution Engine                                                          |
-|                                                                                   |
 |   +--------------------------+   Step Rehash   +------------------------------+   |
 |   |   Primary Table (ht[0])  | <-------------> |   Rehash Target (ht[1])      |   |
 |   |   Active Hash Table      |  O(1) / query   |   Expansion Table            |   |
@@ -54,7 +147,6 @@ A high-performance in-memory key-value storage engine engineered in C++17 speaki
                                           v
 +-----------------------------------------------------------------------------------+
 | Persistence Subsystem (Append-Only File)                                          |
-|                                                                                   |
 |   [ Parent Process ] ---- write() append buffer ------> appendonly.aof            |
 |            |                                                                      |
 |          fork() (Copy-on-Write)                                                   |
@@ -65,142 +157,110 @@ A high-performance in-memory key-value storage engine engineered in C++17 speaki
 +-----------------------------------------------------------------------------------+
 ```
 
----
+Incoming TCP frames are drained into connection-local buffers by edge-triggered epoll. `RespParser` reconstructs array frames, dispatches to `Server::execute()`, and writes replies into connection write buffers. Sockets register for writable events only when unwritten reply data remains.
 
-## Hardware & Environment
+## Persistence and Crash Recovery
 
-- **CPU**: 12th Gen Intel(R) Core(TM) i5-12450H (8 Cores, 12 Threads)
-- **RAM**: 16 GB Dual-Channel
-- **OS / Kernel**: Linux 6.18 / Windows 11 x86_64
-- **Compiler**: GCC 16.1.0 (`-std=c++17 -Wall -Wextra -O2`)
+Mutations (`SET`, `DEL`, `EXPIRE`, `ZADD`) append canonical RESP command arrays to disk:
 
----
+- `always`: Calls synchronous flush immediately on each write. Safest, but disk bound. Zero unacknowledged data loss.
+- `everysec` (Default): Appends to OS page cache per query; a background thread calls `fdatasync()` once per second. Up to 1 second of writes can be lost on ungraceful termination.
+- `no`: Delegates flush timing to the operating system kernel buffer flusher.
 
-## Benchmark Results vs Real Redis
+`BGREWRITEAOF` invokes `fork()` on Linux to write a compact memory snapshot to a temporary file. The parent accumulates subsequent mutations in an in-memory buffer. When the child finishes, the parent flushes accumulated mutations and renames the file to `appendonly.aof`.
 
-Benchmarking protocol: Release build (`-O2`), isolated CPU pinning, 3 runs per configuration reporting the median throughput.
+## Benchmarks
 
-| Workload Configuration | Clone Throughput | Redis 7.0 Throughput | Relative Perf (% of Redis) | p50 Latency | p99 Latency |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `SET` (c=50, P=16, n=1M) | **812,901 ops/sec** | 1,020,000 ops/sec | **79.7%** | 0.032 ms | 0.197 ms |
-| `GET` (c=50, P=16, n=1M) | **687,819 ops/sec** | 940,000 ops/sec | **73.2%** | 0.038 ms | 0.243 ms |
-| `SET` (c=50, P=1, n=1M) | **79,971 ops/sec** | 98,500 ops/sec | **81.2%** | 0.216 ms | 0.805 ms |
-| `GET` (c=50, P=1, n=1M) | **78,622 ops/sec** | 102,000 ops/sec | **77.1%** | 0.206 ms | 0.947 ms |
-| `ZADD` (c=50, P=16, n=1M)| **801,302 ops/sec** | 980,000 ops/sec | **81.8%** | 0.057 ms | 0.124 ms |
+Measurements were captured on an 8-core 12th Gen Intel Core i5-12450H CPU (16 GB RAM) on Windows 11 Build 26200 using GCC 16.1.0 with `-O2`. The benchmark client executed 3 runs per target, reporting median values.
 
----
+| Scenario | Clone QPS | Clone p50 | Clone p99 | Redis 7.0 QPS | Redis p50 | Redis p99 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `SET` (c=50, P=16, n=100k) | 726,253 | 0.039 ms | 0.217 ms | TBD | TBD | TBD |
+| `GET` (c=50, P=16, n=100k) | 634,067 | 0.046 ms | 0.263 ms | TBD | TBD | TBD |
+| `SET` (c=50, P=1, n=50k) | 70,289 | 0.545 ms | 2.755 ms | TBD | TBD | TBD |
+| `GET` (c=50, P=1, n=50k) | 74,711 | 0.520 ms | 2.613 ms | TBD | TBD | TBD |
+| `SET` (c=10000, P=1, n=1M) | TBD | TBD | TBD | TBD | TBD | TBD |
 
-## Rehash Latency Jitter Profile
+*Note: Redis 7.0 side-by-side figures and c=10000 high-descriptor figures are marked TBD pending execution on an identical Linux host with elevated file descriptor limits. See [docs/benchmarks.md](docs/benchmarks.md) for execution commands.*
 
-During continuous writes from 4 to 131,072 buckets, stop-the-world single-threaded table reallocation blocks the event loop proportionally to table size. Progressive rehashing migrates 1 bucket per command, bounding latency jitter:
+## Rehash Latency Profile
 
-```
-Latency Spike Comparison (Max & p99.9 Tail Latency during Hash Table Resizes):
+Progressive rehashing bounds latency spikes by migrating one bucket per command during hash table resizes. In a benchmark inserting 100,000 keys across continuous table doublings (4 to 131,072 buckets):
 
-Stop-The-World Rehash:
-p99.9  [==== 2.35 ms                                                       ]
-Max    [=========================================================== 27.16 ms]
-
+```text
 Progressive Rehash (Our Engine):
-p99.9  [= 0.13 ms                                                         ]
-Max    [== 1.13 ms                                                        ]
+  p50:    0.021 ms
+  p99:    0.050 ms
+  p99.9:  0.127 ms
+  Max:    1.131 ms
+
+Stop-The-World Rehash (Single-step synchronous resize):
+  p99.9:  2.348 ms
+  Max:   27.156 ms
 ```
 
-- **Progressive Rehash**: $p50 = 0.021$ ms, $p99 = 0.050$ ms, $p99.9 = 0.127$ ms, $\text{Max} = 1.131$ ms.
-- **Stop-The-World**: $p99.9 = 2.348$ ms, $\text{Max} = 27.156$ ms ($>24\times$ latency spike).
+While synchronous table reallocation creates a 27 ms latency spike, progressive rehashing keeps max latency at 1.13 ms. Initial table memory allocation and child process fork still incur minor latency overhead.
 
----
+## Memory Overhead
+
+The internal entry structure (`Entry`) stores key strings, value variants, TTL deadlines, frequency counters, and bucket pointers.
+
+- Metadata overhead per key: approximately 72 bytes on 64-bit platforms.
+- Measured resident memory for 100,000 keys (16-byte key, 64-byte value): TBD (run script in [docs/benchmarks.md](docs/benchmarks.md)).
+
+## Testing and Quality
+
+The test suite covers data structure correctness, framing edge cases, concurrent stress, and durability:
+
+```bash
+# Unit tests (hash table, skiplist, parser framing, eviction, ttl)
+./unit_tests
+
+# Blackbox client protocol verification
+python tests/test_blackbox.py
+
+# Concurrent thread stress test
+python tests/test_stress.py
+
+# AOF crash recovery test (SIGKILL mid-write verification)
+python tests/test_persistence_sigkill.py
+```
+
+Sanitizer status:
+- AddressSanitizer (`-fsanitize=address`): TBD (run `make CXXFLAGS="-fsanitize=address -g -O1"`).
+- UndefinedBehaviorSanitizer (`-fsanitize=undefined`): TBD.
+- Valgrind memory leak verification: TBD.
 
 ## Design Trade-Offs
 
-1. **Why Single-Threaded Reactor?**
-   - Eliminates mutex lock contention, condition variable context switches, and cache-line bouncing across multi-core CPUs.
-   - All in-memory structures (`Dict`, `ZSet`, `Lfu`, `Expirer`) require zero locks, maximizing L1/L2 data cache hit ratios.
-   - Predictable deterministic execution order without concurrency hazards or deadlock scenarios.
+- **Single-Threaded Reactor**: Removes lock contention, mutex overhead, and cache-line invalidation. Memory access remains cache local without synchronization primitives.
+- **Edge-Triggered Drain**: Edge-triggered epoll notifications occur only on readiness state transitions. Buffers must drain until `EAGAIN` to prevent socket starvation.
+- **Incremental Rehash**: Avoids blocking the event loop on table expansion by migrating one bucket per query. Lookup queries check both active tables during migration.
+- **Fork Copy-on-Write**: Snapshot rewrites leverage OS copy-on-write page tables. Heavy write traffic during rewrites duplicates modified pages, increasing memory footprint.
 
-2. **Why Edge-Triggered (`EPOLLET`) Needs Drain-Until-`EAGAIN`?**
-   - In edge-triggered mode, the Linux kernel notifies `epoll_wait` only upon state transitions (e.g., when new bytes arrive on a previously idle socket).
-   - If user space reads fewer bytes than available in the OS socket buffer and stops, no further notification will fire for the remaining buffered data until a new packet arrives.
-   - Consequently, the reader routine must loop `recv()` until `EAGAIN` or `EWOULDBLOCK` is returned to prevent request stalls and connection hangs.
+Technical rationale and systems interview questions are documented in [docs/design-notes.md](docs/design-notes.md).
 
-3. **Why Incremental Progressive Rehashing?**
-   - Reallocating and copying a hash table with millions of entries in one synchronous call stalls the reactor thread for 20–50+ ms.
-   - Dual-table progressive rehashing (`ht[0]` and `ht[1]`) amortizes the cost: each read/write migrates exactly 1 non-empty bucket ($O(1)$ amortized overhead).
-   - Lookups search `ht[0]`, falling back to `ht[1]` only if not found during rehash. All new insertions go directly into `ht[1]`, guaranteeing `ht[0]` continuously empties until fully reclaimed.
+## Project Layout
 
-4. **What Does `fork()` Copy-On-Write Cost?**
-   - `fork()` does not immediately copy physical RAM pages; it clones page table descriptors marked as read-only.
-   - While the child process streams the static memory snapshot to disk, every write from the parent triggers an OS page fault and allocates a private 4KB copy of the target page.
-   - Under heavy write load during `BGREWRITEAOF`, memory overhead can approach up to $2\times$ of resident memory as pages are progressively copied.
-
----
-
-## Interview Questions Answered Cold
-
-### 1. Why does edge-triggered epoll require reading until EAGAIN?
-Level-triggered epoll reports whether a socket *is* readable (as long as bytes remain in the kernel buffer). Edge-triggered epoll reports only when the readiness state *changes* (e.g. from no data to data arriving). If you do not drain the socket buffer until `read()` returns `EAGAIN` or `EWOULDBLOCK`, any residual bytes remain unread and the kernel will never generate another event for them until brand new data arrives over TCP. The connection deadlocks waiting on a notification that never fires.
-
-### 2. What happens if a command arrives split across two read() calls?
-TCP is a byte-stream protocol with no frame boundaries. Network fragmentation or MTU limits can split a single RESP command (e.g., `*3\r\n$3\r\nSET...`) across multiple TCP segments. The `RespParser` state machine inspects the accumulated buffer: if a trailing `\r\n` or the length-prefixed bulk byte count is not yet fully received, `next_command()` returns `false` without consuming the partial bytes. The parser retains the prefix in its connection-local buffer and resumes parsing when the subsequent segment arrives.
-
-### 3. Why is incremental rehash needed, and what do lookups do during rehash?
-Synchronous table resizing for large tables ($N > 10^6$) causes severe latency spikes ($> 25$ ms), violating tail latency SLOs. Incremental rehashing allocates `ht[1]` at the next power of two and migrates buckets one by one during subsequent queries (`step_rehash(1)`). During rehashing:
-- Lookups first probe `ht[0]`. If found, they return immediately; if not found, they probe `ht[1]`.
-- Deletions check `ht[0]`, then `ht[1]`.
-- All new insertions write exclusively to `ht[1]`, ensuring `ht[0]` monotonically decreases until empty.
-
-### 4. What does fork() copy, and why can a rewrite double memory under heavy writes?
-`fork()` duplicates the parent's page table entries, pointing both processes to the same physical memory pages with copy-on-write (`COW`) permissions. Physical memory is not duplicated at invocation time. However, if the datastore experiences sustained high write volumes while the child is writing the rewrite file, every write modification to a page triggers an OS page fault that copies the 4KB page. If 100% of the keys are modified during the rewrite window, the process memory footprint doubles ($2\times$ RSS).
-
-### 5. What does everysec lose on a crash, and why?
-With `fsync everysec`, the main reactor thread calls `write()` on every query, pushing mutation commands into the Linux OS page cache. A dedicated background thread executes `fdatasync()` once per second. If the system crashes abruptly (`SIGKILL`, kernel panic, or power cut), any data written to the page cache within the last 1-second interval that has not yet been flushed to non-volatile disk will be lost.
-
-### 6. Why a member->score map next to the skiplist?
-A SkipList provides $O(\log N)$ searches ordered by `score`. However, looking up an element by `member` name would require an $O(N)$ full traversal because the SkipList is indexed by score, not member name. Keeping an auxiliary hash map (`dict[member] -> score`) provides $O(1)$ member existence checks, $O(1)$ `ZSCORE` lookups, and turns `ZADD` member score updates into $O(\log N)$ by locating the old score instantly and re-inserting only that node in the SkipList.
-
----
+```text
+RedisClone/
+├── include/     Header declarations (dict, skiplist, resp, net, evict, expire, aof, server, common)
+├── src/         Implementation files
+├── tests/       Unit, integration, stress, and durability test suites
+├── benchmark/   Throughput and latency benchmark tools
+├── docs/        Architecture design notes and benchmark reproduction details
+├── CMakeLists.txt CMake build definition
+├── Makefile     POSIX Makefile build definition
+└── LICENSE      MIT License
+```
 
 ## Known Limitations
 
-- Single-node design; does not implement multi-node Redis Cluster gossip protocol or Redis Sentinel consensus.
-- No Lua scripting engine or multi-key transaction rollback (`MULTI`/`EXEC` atomicity across commands).
-- Non-blocking AOF rewrite utilizes POSIX `fork()` copy-on-write semantics on Linux; on native Windows environments, a snapshot background worker thread is used as a portability fallback.
+- Standalone single-node engine; does not support Redis Cluster gossip protocol or Redis Sentinel consensus.
+- No Lua scripting execution or multi-key transaction rollback (`MULTI`/`EXEC`).
+- Background AOF rewrite uses POSIX `fork()` copy-on-write semantics on Linux; Windows uses a snapshot worker thread fallback.
 
----
+## License
 
-## Build & Test Instructions
-
-### Building
-```bash
-# Using Makefile
-make
-
-# Using CMake
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
-```
-
-### Running Tests
-```bash
-# Unit tests
-./unit_tests
-
-# Integration tests
-python tests/test_integration.py
-
-# Stress tests
-python tests/test_stress.py
-
-# Black-box SDK compatibility tests
-python tests/test_blackbox.py
-
-# Rehash jitter latency profile
-python tests/test_rehash_jitter.py
-
-# Persistence SIGKILL crash recovery test
-python tests/test_persistence_sigkill.py
-
-# High-concurrency benchmark
-python benchmark/benchmark.py 6379 50 100000 16
-```
+This project is released under the [MIT License](LICENSE).  
+Maintained by [Jayasimha Reddy K](https://github.com/JAYASIMHAREDDYK).

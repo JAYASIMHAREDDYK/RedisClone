@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up C++ Build Tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake python3
+
+    - name: Build Targets
+      run: |
+        make CXXFLAGS="-std=c++17 -Wall -Wextra -O2 -Iinclude"
+
+    - name: Run Unit Tests
+      run: |
+        ./unit_tests
+
+    - name: Run Integration Tests
+      run: |
+        python3 tests/test_integration.py
+
+    - name: Run Blackbox Tests
+      run: |
+        python3 tests/test_blackbox.py
+
+    - name: Run Stress Tests
+      run: |
+        python3 tests/test_stress.py
