@@ -76,6 +76,18 @@ std::string toUpper(std::string_view s) {
     return res;
 }
 
+void toLower(std::string& s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+}
+
+std::string toLower(std::string_view s) {
+    std::string res(s);
+    toLower(res);
+    return res;
+}
+
 std::optional<int64_t> parseInteger(std::string_view s) {
     if (s.empty()) return std::nullopt;
     int64_t val = 0;

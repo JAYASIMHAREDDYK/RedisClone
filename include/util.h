@@ -21,6 +21,9 @@ inline uint64_t hashKey(std::string_view key) {
 void toUpper(std::string& s);
 std::string toUpper(std::string_view s);
 
+void toLower(std::string& s);
+std::string toLower(std::string_view s);
+
 std::optional<int64_t> parseInteger(std::string_view s);
 std::optional<double> parseDouble(std::string_view s);
 

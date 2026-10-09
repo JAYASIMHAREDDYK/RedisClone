@@ -279,6 +279,7 @@ std::optional<uint32_t> SortedSet::getRank(const std::string& member) const {
 }
 
 std::vector<std::pair<std::string, double>> SortedSet::range(int64_t start, int64_t stop, bool with_scores) const {
+    (void)with_scores;
     std::vector<std::pair<std::string, double>> result;
     int64_t total = static_cast<int64_t>(skiplist.length);
     if (total == 0) return result;
@@ -307,6 +308,7 @@ std::vector<std::pair<std::string, double>> SortedSet::rangeByScore(
     bool min_inclusive, bool max_inclusive,
     int64_t offset, int64_t count,
     bool with_scores) const {
+    (void)with_scores;
     std::vector<std::pair<std::string, double>> result;
     if (skiplist.length == 0) return result;
 

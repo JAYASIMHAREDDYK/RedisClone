@@ -585,6 +585,7 @@ void Server::cmdZCard(ClientConnection& client, const std::vector<std::string>& 
 }
 
 void Server::cmdBgRewriteAof(ClientConnection& client, const std::vector<std::string>& args) {
+    (void)args;
     if (!config_.aof_enabled) {
         client.appendWrite(RespEncoder::error("AOF is disabled"));
         return;
@@ -604,6 +605,7 @@ void Server::cmdBgRewriteAof(ClientConnection& client, const std::vector<std::st
 }
 
 void Server::cmdInfo(ClientConnection& client, const std::vector<std::string>& args) {
+    (void)args;
     uint32_t uptime = getUnixTimeSec() - static_cast<uint32_t>(stats_.start_time_sec);
 
     std::ostringstream ss;
@@ -628,6 +630,7 @@ void Server::cmdInfo(ClientConnection& client, const std::vector<std::string>& a
 }
 
 void Server::cmdCommand(ClientConnection& client, const std::vector<std::string>& args) {
+    (void)args;
     client.appendWrite(RespEncoder::emptyArray());
 }
 
