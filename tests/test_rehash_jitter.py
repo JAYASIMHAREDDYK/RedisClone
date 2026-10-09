@@ -6,7 +6,8 @@ import sys
 import os
 
 def run_rehash_jitter_test(port=6395, num_keys=100000):
-    server = subprocess.Popen([".\\redis-server.exe", "-p", str(port), "--aof", "no"])
+    server_bin = ".\\redis-server.exe" if os.name == 'nt' else "./redis-server"
+    server = subprocess.Popen([server_bin, "-p", str(port), "--aof", "no"])
     time.sleep(0.6)
 
     try:

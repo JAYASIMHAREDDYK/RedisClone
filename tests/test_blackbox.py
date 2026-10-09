@@ -56,7 +56,8 @@ class RedisProtocolClient:
 
 def run_blackbox_suite():
     port = 6397
-    proc = subprocess.Popen([".\\redis-server.exe", "-p", str(port), "--aof", "no"])
+    server_bin = ".\\redis-server.exe" if os.name == 'nt' else "./redis-server"
+    proc = subprocess.Popen([server_bin, "-p", str(port), "--aof", "no"])
     time.sleep(0.5)
 
     try:

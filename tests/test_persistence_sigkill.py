@@ -45,13 +45,14 @@ class SimpleClient:
             pass
 
 def run_persistence_sigkill_test():
+    server_bin = ".\\redis-server.exe" if os.name == 'nt' else "./redis-server"
     port = 6396
     aof_name = f"appendonly_{port}.aof"
     if os.path.exists(aof_name):
         os.remove(aof_name)
 
     proc = subprocess.Popen([
-        ".\\redis-server.exe",
+        server_bin,
         "-p", str(port),
         "--aof", "yes",
         "--fsync", "always"
@@ -95,7 +96,7 @@ def run_persistence_sigkill_test():
 
         # Restart server and verify replay
         proc2 = subprocess.Popen([
-            ".\\redis-server.exe",
+            server_bin,
             "-p", str(port),
             "--aof", "yes",
             "--fsync", "always"

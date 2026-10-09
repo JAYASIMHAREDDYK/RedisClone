@@ -36,8 +36,9 @@ def client_worker(port, thread_id, num_ops, error_list):
 
 def run_stress():
     port = 6389
+    server_bin = ".\\redis-server.exe" if os.name == 'nt' else "./redis-server"
     proc = subprocess.Popen([
-        ".\\redis-server.exe",
+        server_bin,
         "-p", str(port),
         "--aof", "no"
     ])

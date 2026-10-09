@@ -66,8 +66,9 @@ def run_tests():
     if os.path.exists(aof_file):
         os.remove(aof_file)
 
+    server_bin = ".\\redis-server.exe" if os.name == 'nt' else "./redis-server"
     proc = subprocess.Popen([
-        ".\\redis-server.exe",
+        server_bin,
         "-p", str(port),
         "--aof", "yes"
     ])
@@ -145,7 +146,7 @@ def run_tests():
 
         time.sleep(0.5)
         proc2 = subprocess.Popen([
-            ".\\redis-server.exe",
+            server_bin,
             "-p", str(port),
             "--aof", "yes"
         ])
