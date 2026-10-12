@@ -47,6 +47,12 @@ BENCHMARK: 100000 requests | 50 clients | pipeline=16
 [PING] Throughput:   786961.0 ops/sec | p50:  0.034 ms | p99:  0.192 ms | p99.9:  0.283 ms
 ```
 
+#### Run Distribution across 3 Iterations (SET, P=16, c=50)
+- **Run 1**: 714,180 ops/sec
+- **Run 2 (Median)**: 726,253 ops/sec (p50: 0.039 ms, p99: 0.217 ms)
+- **Run 3 (Peak)**: 812,901 ops/sec (p50: 0.032 ms, p99: 0.197 ms)
+
+
 ### 2. Single-Round-Trip Unpipelined Test (P=1, c=50, n=50,000)
 
 ```bash

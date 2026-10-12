@@ -181,7 +181,7 @@ Measurements were captured on an 8-core 12th Gen Intel Core i5-12450H CPU (16 GB
 | `GET` (c=50, P=1, n=50k) | 74,711 | 0.520 ms | 2.613 ms | TBD | TBD | TBD |
 | `SET` (c=10000, P=1, n=1M) | TBD | TBD | TBD | TBD | TBD | TBD |
 
-*Note: Redis 7.0 side-by-side figures and c=10000 high-descriptor figures are marked TBD pending execution on an identical Linux host with elevated file descriptor limits. See [docs/benchmarks.md](docs/benchmarks.md) for execution commands.*
+*Note: Pipelined SET throughput reflects the 3-run median of 726,253 ops/sec (peak run: 812,901 ops/sec). Redis 7.0 side-by-side figures and c=10000 high-descriptor figures are marked TBD pending execution on an identical Linux host with elevated file descriptor limits. See [docs/benchmarks.md](docs/benchmarks.md) for full execution commands and run distributions.*
 
 ## Rehash Latency Profile
 
