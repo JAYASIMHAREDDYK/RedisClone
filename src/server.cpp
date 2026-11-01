@@ -804,7 +804,8 @@ void Server::cmd_replicaof(Client& client, const vector<string>& args) {
         stop_replication();
         server_mutex_.lock();
         role_ = NodeRole::Master;
-        has_active_replication_ = !replicas_.empty();
+        repl_id_ = generate_replication_id();
+        has_active_replication_ = true;
         client.write(RespWriter::ok());
         return;
     }

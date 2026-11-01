@@ -19,23 +19,39 @@ void ReplicationBacklog::feed(const std::string& raw_resp) {
 void ReplicationBacklog::feed(const char* data, size_t len) {
     if (!data || len == 0) return;
 
-    master_offset_ += static_cast<int64_t>(len);
-
     if (len >= max_size_) {
-        data += (len - max_size_);
-        len = max_size_;
-        write_idx_ = 0;
+        // Discard prefix that falls outside the circular window.
+        // We only keep the last max_size_ bytes of this write.
+        const char* kept_data = data + (len - max_size_);
+        int64_t kept_start_offset = master_offset_ + static_cast<int64_t>(len - max_size_);
+        size_t write_idx = static_cast<size_t>(kept_start_offset % max_size_);
+
+        size_t chunk1 = std::min(max_size_, max_size_ - write_idx);
+        std::memcpy(&buffer_[write_idx], kept_data, chunk1);
+
+        size_t chunk2 = max_size_ - chunk1;
+        if (chunk2 > 0) {
+            std::memcpy(&buffer_[0], kept_data + chunk1, chunk2);
+        }
+
+        master_offset_ += static_cast<int64_t>(len);
+        stored_bytes_ = max_size_;
+        start_offset_ = kept_start_offset;
+        write_idx_ = static_cast<size_t>(master_offset_ % max_size_);
+        return;
     }
 
-    size_t chunk1 = std::min(len, max_size_ - write_idx_);
-    std::memcpy(&buffer_[write_idx_], data, chunk1);
+    size_t write_idx = static_cast<size_t>(master_offset_ % max_size_);
+    size_t chunk1 = std::min(len, max_size_ - write_idx);
+    std::memcpy(&buffer_[write_idx], data, chunk1);
 
     size_t chunk2 = len - chunk1;
     if (chunk2 > 0) {
         std::memcpy(&buffer_[0], data + chunk1, chunk2);
     }
 
-    write_idx_ = (write_idx_ + len) % max_size_;
+    master_offset_ += static_cast<int64_t>(len);
+    write_idx_ = static_cast<size_t>(master_offset_ % max_size_);
     stored_bytes_ = std::min(stored_bytes_ + len, max_size_);
     start_offset_ = master_offset_ - static_cast<int64_t>(stored_bytes_);
 }
@@ -60,7 +76,7 @@ std::string ReplicationBacklog::get_data(int64_t from_offset) const {
     std::string result;
     result.resize(bytes_to_read);
 
-    size_t ring_idx = static_cast<size_t>((write_idx_ + max_size_ - (master_offset_ - from_offset) % max_size_) % max_size_);
+    size_t ring_idx = static_cast<size_t>(from_offset % max_size_);
 
     size_t chunk1 = std::min(bytes_to_read, max_size_ - ring_idx);
     std::memcpy(&result[0], &buffer_[ring_idx], chunk1);

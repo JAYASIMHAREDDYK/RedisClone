@@ -251,19 +251,57 @@ void test_replication_backlog() {
     assert(backlog.get_data(14) == "");
     assert(backlog.can_partial_resync(my_id, -1, my_id) == false);
 
-    // 5. Payload larger than the entire buffer
+    // 5. Payload larger than the entire buffer with unaligned offset and distinct byte assertion
     redis::ReplicationBacklog backlog_large(50);
-    string oversized(120, 'X');
-    for (int i = 100; i < 120; ++i) oversized[i] = 'Y';
-    backlog_large.feed(oversized);
+    // Write 17 bytes first so initial write_idx is unaligned (17 % 50 != 0)
+    string prefix(17, 'P');
+    backlog_large.feed(prefix);
+    assert(backlog_large.master_offset() == 17);
+    assert(backlog_large.start_offset() == 0);
 
-    assert(backlog_large.master_offset() == 120);
+    // Feed 137 bytes (not a multiple of 50) of distinct sequential characters
+    string distinct_oversized;
+    distinct_oversized.reserve(137);
+    for (int i = 0; i < 137; ++i) {
+        distinct_oversized.push_back(static_cast<char>('A' + (i % 26)));
+    }
+    backlog_large.feed(distinct_oversized);
+
+    // Master offset is 17 + 137 = 154
+    // Start offset is 154 - 50 = 104
+    assert(backlog_large.master_offset() == 154);
     assert(backlog_large.size() == 50);
-    assert(backlog_large.start_offset() == 70); // 120 - 50
+    assert(backlog_large.start_offset() == 104);
 
-    string read_oversized = backlog_large.get_data(70);
-    assert(read_oversized.size() == 50);
-    assert(read_oversized == string(30, 'X') + string(20, 'Y'));
+    // The retained 50 bytes must match the trailing 50 bytes of distinct_oversized (from index 137 - 50 = 87)
+    string expected_retained = distinct_oversized.substr(137 - 50, 50);
+    string read_full = backlog_large.get_data(104);
+    assert(read_full.size() == 50);
+    assert(read_full == expected_retained);
+
+    // Read sub-window
+    string read_sub = backlog_large.get_data(124);
+    assert(read_sub == distinct_oversized.substr(137 - 30, 30));
+
+    // 6. Subsequent write with wraparound after an oversize payload
+    string post_wrap;
+    post_wrap.reserve(33);
+    for (int i = 0; i < 33; ++i) {
+        post_wrap.push_back(static_cast<char>('0' + (i % 10)));
+    }
+    backlog_large.feed(post_wrap);
+
+    // Master offset is 154 + 33 = 187
+    // Start offset is 187 - 50 = 137
+    assert(backlog_large.master_offset() == 187);
+    assert(backlog_large.size() == 50);
+    assert(backlog_large.start_offset() == 137);
+
+    // Expected 50 bytes: last 17 bytes from distinct_oversized + all 33 bytes from post_wrap
+    string expected_after_wrap = distinct_oversized.substr(137 - 17, 17) + post_wrap;
+    string read_after_wrap = backlog_large.get_data(137);
+    assert(read_after_wrap.size() == 50);
+    assert(read_after_wrap == expected_after_wrap);
 }
 
 int main() {

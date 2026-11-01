@@ -13,15 +13,16 @@
 ## Measured Engineering Highlights
 
 - **Head-to-Head Benchmark vs Official Redis 7.0**: Tested across 5 interleaved runs using identical flags (`redis-benchmark -c 50 -P 16 -n 1000000 -t set,get`), pinned to isolated cores with `taskset` in WSL2 Debian 12 (both in-memory without AOF in the same session):
-  - **Standard Key Workload**:
-    - **Pipelined SET**: **2,493,766 ops/sec** (**125.9%** of official Redis 1,980,198 ops/sec; p50: 0.495 ms).
-    - **Pipelined GET**: **2,801,120 ops/sec** (**120.2%** of official Redis 2,331,002 ops/sec; p50: 0.335 ms).
-  - **Random Keyspace Workload (`-r 1,000,000`)**:
+  - **Random Keyspace Workload (`-r 1,000,000`) [Primary Real-World Metric]**:
     - **Pipelined SET**: **766,871 ops/sec** (**83.4%** of official Redis 919,963 ops/sec; p50: 1.303 ms).
     - **Pipelined GET**: **970,874 ops/sec** (**80.1%** of official Redis 1,212,121 ops/sec; p50: 1.015 ms).
+  - **Single Hot Key Workload (Default Benchmark Key)**:
+    - **Pipelined SET**: **2,493,766 ops/sec** (**125.9%** of official Redis 1,980,198 ops/sec; p50: 0.495 ms).
+    - **Pipelined GET**: **2,801,120 ops/sec** (**120.2%** of official Redis 2,331,002 ops/sec; p50: 0.335 ms).
+    - *Redis does more per command (ACL checks, command stats, keyspace notifications, cluster hooks, and multi-DB indexing), so exceeding it on a trivial single-key workload does not mean the clone is faster than Redis; the 1M random-keyspace benchmark represents the honest hash table comparison.*
 - **Fuzzed RESP Parser (4 Bugs Found & Fixed)**: Hardened via LLVM `libFuzzer` + AddressSanitizer/UBSan across **1,255,730 executions** (~40,500 exec/sec), uncovering and resolving 4 edge-case vulnerabilities (OOM DoS via unbounded multi-bulk array reservation, `size_t` integer overflow on bulk lengths, connection hang on blank inline commands, and null bulk frame handling). See [docs/fuzzing.md](docs/fuzzing.md).
-- **Quantified Failover Write Durability**: Empirically measured acknowledged write loss by killing the primary with `SIGKILL` mid-stream:
-  - Lost **5,327 of 10,000 acknowledged writes under async failover versus 0 of 300 with WAIT** *when promoting the acknowledging replica*, trading non-blocking write speed for synchronous barrier latency (~1.2 ms per batch). Note: `WAIT` ensures safety only if the acknowledged replica is the one promoted. See [benchmark/results/failover_durability.txt](benchmark/results/failover_durability.txt).
+- **Quantified Failover Write Durability**: Empirically measured acknowledged write loss by killing the primary with `SIGKILL` under active write load across 10,000 acknowledged writes:
+  - Lost **6,193 of 10,000 acknowledged writes under async failover versus 0 of 10,000 with WAIT** *when promoting the acknowledging replica*, trading non-blocking write speed for synchronous barrier latency (~1.2 ms per batch). Note: `WAIT` ensures safety only if the acknowledged replica is the one promoted. See [benchmark/results/failover_durability.txt](benchmark/results/failover_durability.txt).
 
 ---
 
@@ -31,12 +32,12 @@ RedisClone is a standalone, single-threaded in-memory datastore engineered aroun
 
 | Workload Configuration | Operation | RedisClone (Ops/sec) | Official Redis 7.0 (Ops/sec) | % of Redis | p50 Latency (RedisClone) |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| **Standard Key** | `SET` | **2,493,766** | 1,980,198 | **125.9%** | 0.495 ms |
-| **Standard Key** | `GET` | **2,801,120** | 2,331,002 | **120.2%** | 0.335 ms |
 | **Random Keyspace (`-r 1M`)** | `SET` | **766,871** | 919,963 | **83.4%** | 1.303 ms |
 | **Random Keyspace (`-r 1M`)** | `GET` | **970,874** | 1,212,121 | **80.1%** | 1.015 ms |
+| **Single Hot Key (Default)** | `SET` | **2,493,766** | 1,980,198 | **125.9%** | 0.495 ms |
+| **Single Hot Key (Default)** | `GET` | **2,801,120** | 2,331,002 | **120.2%** | 0.335 ms |
 
-*Note: Benchmarks were executed inside WSL2 Debian 12 (pinned with `taskset`); WSL2 virtualization introduces scheduling noise compared to bare-metal Linux. All figures represent medians across 5 interleaved runs with $n = 1,000,000$, $P = 16$, $c = 50$, both operating in-memory (`--aof no` vs `--appendonly no --save ""`). Profile call graphs and flame graph archived in [benchmark/results/flamegraph.svg](benchmark/results/flamegraph.svg); raw outputs archived in `benchmark/results/`.*
+*Note: Benchmarks were executed inside WSL2 Debian 12 (pinned with `taskset`); WSL2 virtualization introduces scheduling noise compared to bare-metal Linux. All figures represent medians across 5 interleaved runs with $n = 1,000,000$, $P = 16$, $c = 50$, both operating in-memory (`--aof no` vs `--appendonly no --save ""`). Single-key results exceed Redis because the clone omits Redis's internal ACL and command statistics dispatch; the 1M random-keyspace benchmark is the primary architectural comparison. Profile call graphs and flame graph archived in [benchmark/results/flamegraph.svg](benchmark/results/flamegraph.svg); raw outputs archived in `benchmark/results/`.*
 
 ---
 

@@ -159,8 +159,28 @@ def run_tests():
         assert r2 == "val2", f"AOF recovery failed for persist2: {r2}"
         client2.close()
 
-        proc2.terminate()
-        proc2.wait(timeout=3)
+        # Test eviction with maxmemory actively configured
+        proc3 = subprocess.Popen([
+            server_bin,
+            "-p", str(port + 1),
+            "--aof", "no",
+            "-m", "1500",
+            "--policy", "allkeys-lru"
+        ])
+        time.sleep(0.5)
+        try:
+            client3 = RedisClient(port=port + 1)
+            for i in range(50):
+                client3.send_command("SET", f"evict_key_{i}", "val" * 30)
+            # Verify that earlier keys were evicted under the 1500-byte cap
+            r_early = client3.send_command("GET", "evict_key_0")
+            r_late = client3.send_command("GET", "evict_key_49")
+            assert r_early is None, f"Expected evict_key_0 to be evicted, got {r_early}"
+            assert r_late is not None, f"Expected evict_key_49 to be present"
+            client3.close()
+        finally:
+            proc3.terminate()
+            proc3.wait(timeout=3)
 
         print("ALL INTEGRATION TESTS PASSED SUCCESSFULLY!")
 

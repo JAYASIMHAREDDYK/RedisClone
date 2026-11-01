@@ -125,14 +125,53 @@ def main():
         send_cmd(sr, ["INFO"])
         info_r = read_resp(sr)
         assert "role:master" in info_r, f"Expected role:master after promotion, got {info_r}"
+        assert "repl_backlog_active:1" in info_r, f"Promoted replica must have active backlog, got {info_r}"
 
-        # Replica now promoted to Master -> should accept writes!
+        # Replica now promoted to Master -> should accept writes AND feed its own backlog!
+        offset_before_promoted_write = 0
+        for line in info_r.splitlines():
+            if line.startswith("master_repl_offset:"):
+                offset_before_promoted_write = int(line.split(":")[1])
+
         send_cmd(sr, ["SET", "promoted_key", "success"])
         res = read_resp(sr)
         assert "+OK" in res
         send_cmd(sr, ["GET", "promoted_key"])
         assert read_resp(sr) == "success"
-        print("[PASS] Manual Promotion (REPLICAOF NO ONE)")
+
+        send_cmd(sr, ["INFO"])
+        info_r_after = read_resp(sr)
+        offset_after_promoted_write = 0
+        for line in info_r_after.splitlines():
+            if line.startswith("master_repl_offset:"):
+                offset_after_promoted_write = int(line.split(":")[1])
+        assert offset_after_promoted_write > offset_before_promoted_write, (
+            f"Promoted master must advance its master_repl_offset on write ({offset_after_promoted_write} > {offset_before_promoted_write})"
+        )
+        print("[PASS] Manual Promotion (REPLICAOF NO ONE & Backlog Feed)")
+
+        # Verify Master keeps its backlog active even after replica detached
+        send_cmd(sm, ["INFO"])
+        info_m_post = read_resp(sm)
+        assert "repl_backlog_active:1" in info_m_post, f"Master backlog must stay active after replica detach, got {info_m_post}"
+        offset_before_detach_write = 0
+        for line in info_m_post.splitlines():
+            if line.startswith("master_repl_offset:"):
+                offset_before_detach_write = int(line.split(":")[1])
+
+        send_cmd(sm, ["SET", "post_detach_key", "active"])
+        assert "+OK" in read_resp(sm)
+
+        send_cmd(sm, ["INFO"])
+        info_m_after = read_resp(sm)
+        offset_after_detach_write = 0
+        for line in info_m_after.splitlines():
+            if line.startswith("master_repl_offset:"):
+                offset_after_detach_write = int(line.split(":")[1])
+        assert offset_after_detach_write > offset_before_detach_write, (
+            f"Master must continue advancing backlog offset after replica disconnects ({offset_after_detach_write} > {offset_before_detach_write})"
+        )
+        print("[PASS] Master backlog persists and accumulates across replica disconnection")
 
         print("\nALL REPLICATION TESTS PASSED SUCCESSFULLY!")
 

@@ -36,7 +36,7 @@ def read_resp(f):
         return line_str.strip()
     return line_str.strip()
 
-def run_scenario(use_wait=False, total_ops=50000):
+def run_scenario(use_wait=False, total_ops=10000):
     for f in ["master.aof", "replica.aof", "temp-rewrite.aof"]:
         if os.path.exists(f):
             os.remove(f)
@@ -55,41 +55,23 @@ def run_scenario(use_wait=False, total_ops=50000):
     fm = sm_sock.makefile('rwb')
 
     acknowledged = []
-    stop_writer = False
+    burst_len = 100
 
-    def writer_worker():
-        nonlocal stop_writer
-        idx = 0
-        while not stop_writer and idx < total_ops:
-            burst_len = 100
-            chunk = [f"key_{idx + j}" for j in range(burst_len)]
-            try:
-                for k in chunk:
-                    send_cmd(fm, ["SET", k, f"val_{k}"])
-                for k in chunk:
-                    res = read_resp(fm)
-                    if res and "+OK" in res:
-                        acknowledged.append(k)
-                if use_wait:
-                    send_cmd(fm, ["WAIT", "1", "1000"])
-                    read_resp(fm)
-                idx += burst_len
-            except Exception:
-                break
+    for idx in range(0, total_ops, burst_len):
+        chunk = [f"key_{idx + j}" for j in range(burst_len)]
+        for k in chunk:
+            send_cmd(fm, ["SET", k, f"val_{k}"])
+        for k in chunk:
+            res = read_resp(fm)
+            if res and "+OK" in res:
+                acknowledged.append(k)
+        if use_wait:
+            send_cmd(fm, ["WAIT", "1", "1000"])
+            read_resp(fm)
 
-    import threading
-    t = threading.Thread(target=writer_worker)
-    t.start()
-
-    # Allow load to build up actively
-    time.sleep(0.08)
-
-    # Forcibly terminate primary mid-stream while writer is actively receiving acks
+    # Forcibly terminate primary immediately with SIGKILL
     master.send_signal(signal.SIGKILL)
     master.wait()
-
-    stop_writer = True
-    t.join()
 
     time.sleep(0.2)
 
@@ -131,7 +113,7 @@ def main():
     print(f"  -> Lost Acknowledged Writes on SIGKILL: {lost_a} ({loss_rate_a:.2f}% data loss)")
 
     print("\n[2/2] Running Scenario B: Synchronous Replication Barrier (WAIT 1)...")
-    ack_b, lost_b, rec_b = run_scenario(use_wait=True, total_ops=1000)
+    ack_b, lost_b, rec_b = run_scenario(use_wait=True, total_ops=10000)
     loss_rate_b = (lost_b / ack_b * 100.0) if ack_b > 0 else 0.0
     print(f"  -> Total Acknowledged Writes: {ack_b}")
     print(f"  -> Preserved Writes on Promoted Replica: {rec_b}")
