@@ -37,16 +37,24 @@ struct Client {
     uint64_t last_active_time{0};
     bool close_after_write{false};
 
+    // Transaction state
+    bool in_multi{false};
+    bool dirty_exec{false};
+    std::vector<std::vector<std::string>> multi_commands;
+    std::string* write_target{nullptr};
+
     Client(socket_t sock, std::string client_ip, uint16_t client_port);
     ~Client();
 
     void write(std::string_view data);
+    void reset_transaction();
 };
 
 class EventLoop {
 public:
     using CommandHandler = std::function<void(Client&, const std::vector<std::string>&)>;
     using TickHandler = std::function<void()>;
+    using CloseHandler = std::function<void(socket_t)>;
 
     EventLoop(std::string bind_ip = "0.0.0.0", int port = 6379);
     ~EventLoop();
@@ -60,6 +68,7 @@ public:
 
     void on_command(CommandHandler handler) { command_handler_ = std::move(handler); }
     void on_tick(TickHandler handler) { tick_handler_ = std::move(handler); }
+    void on_client_close(CloseHandler handler) { close_handler_ = std::move(handler); }
     void set_idle_timeout(uint32_t seconds) { idle_timeout_sec_ = seconds; }
 
     size_t client_count() const { return clients_.size(); }
@@ -75,6 +84,7 @@ private:
 
     CommandHandler command_handler_;
     TickHandler tick_handler_;
+    CloseHandler close_handler_;
 
     std::unordered_map<socket_t, std::unique_ptr<Client>> clients_;
 

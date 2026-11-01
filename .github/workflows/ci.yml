@@ -45,6 +45,10 @@ jobs:
       run: |
         python3 tests/test_replication.py
 
+    - name: Run Transaction & Optimistic Locking Tests
+      run: |
+        python3 tests/test_transactions.py
+
     - name: Throughput Regression Smoke Check
       run: |
         python3 benchmark/ci_regression_smoke.py
@@ -74,6 +78,10 @@ jobs:
     - name: Run Sanitized Integration Tests
       run: |
         python3 tests/test_integration.py
+
+    - name: Run Sanitized Transaction Tests
+      run: |
+        python3 tests/test_transactions.py
 
     - name: Build & Run libFuzzer Target (Smoke Test)
       run: |

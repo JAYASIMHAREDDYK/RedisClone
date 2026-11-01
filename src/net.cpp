@@ -29,7 +29,18 @@ Client::~Client() {
 }
 
 void Client::write(string_view data) {
-    write_buf.append(data);
+    if (write_target) {
+        write_target->append(data);
+    } else {
+        write_buf.append(data);
+    }
+}
+
+void Client::reset_transaction() {
+    in_multi = false;
+    dirty_exec = false;
+    multi_commands.clear();
+    write_target = nullptr;
 }
 
 EventLoop::EventLoop(string bind_ip, int port)
@@ -236,6 +247,9 @@ void EventLoop::close(socket_t fd) {
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     }
 #endif
+    if (close_handler_) {
+        close_handler_(fd);
+    }
     clients_.erase(fd);
 }
 

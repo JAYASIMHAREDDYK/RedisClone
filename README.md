@@ -56,6 +56,7 @@ RedisClone is a standalone, single-threaded in-memory datastore engineered aroun
 | Log Compaction | Background AOF Rewrite | Implemented | `fork()` copy-on-write on Linux; worker snapshot fallback on Windows |
 | Replication | Async Primary-Replica | Implemented | 1MB backlog, byte offsets, snapshot full sync, `+CONTINUE` partial resync |
 | High Availability | Failover & WAIT | Implemented | `REPLICAOF NO ONE` promotion; `WAIT` semi-synchronous replication barrier |
+| Transactions | MULTI / EXEC / DISCARD / WATCH | Implemented | Atomic command queuing, EXECABORT error gating, optimistic locking via WATCH / UNWATCH |
 
 ---
 
@@ -124,6 +125,11 @@ OK
 | `REPLICAOF NO ONE` | O(1) | Promotes replica to standalone primary node. |
 | `WAIT numreplicas timeout` | O(N) | Blocks until `numreplicas` acknowledge current write offset. |
 | `PSYNC repl_id offset` | O(1) / O(N) | Initiates full snapshot resync or partial backlog resync. |
+| `MULTI` | O(1) | Begins transaction block; subsequent commands are queued. |
+| `EXEC` | O(N) | Atomically executes queued commands; returns array of results or nil on abort. |
+| `DISCARD` | O(N) | Flushes transaction queue and exits transaction block. |
+| `WATCH key [key ...]` | O(K) | Monitors keys for optimistic locking; aborts EXEC if modified. |
+| `UNWATCH` | O(1) | Clears all watched keys for client. |
 
 ---
 

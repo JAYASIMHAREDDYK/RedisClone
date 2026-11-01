@@ -83,8 +83,11 @@ bool Server::del_key(const string& key) {
     expire_.clear_expire(entry);
 
     bool ok = dict_.erase(key);
-    if (ok && stats_.used_memory_bytes >= sz) {
-        stats_.used_memory_bytes -= sz;
+    if (ok) {
+        touch_watched_key(key);
+        if (stats_.used_memory_bytes >= sz) {
+            stats_.used_memory_bytes -= sz;
+        }
     }
     return ok;
 }
@@ -141,6 +144,11 @@ void Server::setup_handlers() {
 
     loop_.on_tick([this]() {
         cron();
+    });
+
+    loop_.on_client_close([this](socket_t fd) {
+        std::lock_guard<std::mutex> lock(server_mutex_);
+        unwatch_client(fd);
     });
 }
 
@@ -232,15 +240,274 @@ void Server::execute(Client& client, const vector<string>& args) {
     execute_internal(client, args, false);
 }
 
+static bool is_mutation_cmd(const string& cmd) {
+    return cmd == "SET" || cmd == "DEL" || cmd == "EXPIRE" || cmd == "ZADD";
+}
+
+enum class ArityResult {
+    Ok,
+    Unknown,
+    WrongArity
+};
+
+static ArityResult check_cmd_arity(const vector<string>& args) {
+    if (args.empty()) return ArityResult::Unknown;
+    string cmd = to_upper(args[0]);
+    size_t n = args.size();
+
+    if (cmd == "PING") {
+        return (n >= 1 && n <= 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "ECHO") {
+        return (n == 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "SET") {
+        return (n >= 3) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "GET") {
+        return (n == 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "DEL") {
+        return (n >= 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "EXISTS") {
+        return (n >= 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "EXPIRE") {
+        return (n == 3) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "TTL") {
+        return (n == 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "ZADD") {
+        return (n >= 4) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "ZRANGE") {
+        return (n >= 4 && n <= 5) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "ZRANGEBYSCORE") {
+        return (n >= 4 && n <= 7) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "ZSCORE") {
+        return (n == 3) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "ZCARD") {
+        return (n == 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "BGREWRITEAOF") {
+        return (n == 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "INFO") {
+        return (n <= 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "COMMAND") {
+        return (n >= 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "REPLICAOF" || cmd == "SLAVEOF") {
+        return (n == 3) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "WAIT") {
+        return (n == 3) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "PSYNC") {
+        return (n == 3) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "SYNC") {
+        return (n == 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "REPLCONF") {
+        return (n >= 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "MULTI") {
+        return (n == 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "EXEC") {
+        return (n == 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "DISCARD") {
+        return (n == 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "WATCH") {
+        return (n >= 2) ? ArityResult::Ok : ArityResult::WrongArity;
+    } else if (cmd == "UNWATCH") {
+        return (n == 1) ? ArityResult::Ok : ArityResult::WrongArity;
+    }
+    return ArityResult::Unknown;
+}
+
+void Server::touch_watched_key(const string& key) {
+    auto it = watched_keys_.find(key);
+    if (it != watched_keys_.end()) {
+        for (socket_t fd : it->second) {
+            client_watch_dirty_[fd] = true;
+        }
+    }
+}
+
+bool Server::is_watch_dirty(socket_t fd) const {
+    auto it = client_watch_dirty_.find(fd);
+    if (it != client_watch_dirty_.end()) {
+        return it->second;
+    }
+    return false;
+}
+
+void Server::unwatch_client(socket_t fd) {
+    auto it = client_watched_keys_.find(fd);
+    if (it != client_watched_keys_.end()) {
+        for (const auto& key : it->second) {
+            auto kit = watched_keys_.find(key);
+            if (kit != watched_keys_.end()) {
+                kit->second.erase(fd);
+                if (kit->second.empty()) {
+                    watched_keys_.erase(kit);
+                }
+            }
+        }
+        client_watched_keys_.erase(it);
+    }
+    client_watch_dirty_.erase(fd);
+}
+
+void Server::cmd_multi(Client& client, const vector<string>& args) {
+    if (args.size() != 1) {
+        client.write(RespWriter::error("wrong number of arguments for 'multi' command"));
+        return;
+    }
+    if (client.in_multi) {
+        client.dirty_exec = true;
+        client.write(RespWriter::error("MULTI calls can not be nested"));
+        return;
+    }
+    client.in_multi = true;
+    client.dirty_exec = false;
+    client.multi_commands.clear();
+    client.write(RespWriter::ok());
+}
+
+void Server::cmd_discard(Client& client, const vector<string>& args) {
+    if (args.size() != 1) {
+        client.write(RespWriter::error("wrong number of arguments for 'discard' command"));
+        return;
+    }
+    if (!client.in_multi) {
+        client.write(RespWriter::error("DISCARD without MULTI"));
+        return;
+    }
+    client.reset_transaction();
+    unwatch_client(client.fd);
+    client.write(RespWriter::ok());
+}
+
+void Server::cmd_exec(Client& client, const vector<string>& args) {
+    if (args.size() != 1) {
+        client.write(RespWriter::error("wrong number of arguments for 'exec' command"));
+        return;
+    }
+    if (!client.in_multi) {
+        client.write(RespWriter::error("EXEC without MULTI"));
+        return;
+    }
+
+    if (client.dirty_exec) {
+        client.reset_transaction();
+        unwatch_client(client.fd);
+        client.write(RespWriter::error_with_code("EXECABORT", "Transaction discarded because of previous errors."));
+        return;
+    }
+
+    if (is_watch_dirty(client.fd)) {
+        client.reset_transaction();
+        unwatch_client(client.fd);
+        client.write(RespWriter::null_bulk());
+        return;
+    }
+
+    unwatch_client(client.fd);
+
+    auto cmds = std::move(client.multi_commands);
+    client.reset_transaction();
+
+    if (cmds.empty()) {
+        client.write(RespWriter::empty_array());
+        return;
+    }
+
+    string exec_body;
+    client.write_target = &exec_body;
+
+    for (const auto& cmd_args : cmds) {
+        dispatch_command(client, cmd_args, false);
+    }
+
+    client.write_target = nullptr;
+    string resp = "*" + std::to_string(cmds.size()) + "\r\n" + exec_body;
+    client.write(resp);
+}
+
+void Server::cmd_watch(Client& client, const vector<string>& args) {
+    if (args.size() < 2) {
+        client.write(RespWriter::error("wrong number of arguments for 'watch' command"));
+        return;
+    }
+    if (client.in_multi) {
+        client.dirty_exec = true;
+        client.write(RespWriter::error("WATCH inside MULTI is not allowed"));
+        return;
+    }
+    for (size_t i = 1; i < args.size(); ++i) {
+        watched_keys_[args[i]].insert(client.fd);
+        client_watched_keys_[client.fd].insert(args[i]);
+    }
+    client.write(RespWriter::ok());
+}
+
+void Server::cmd_unwatch(Client& client, const vector<string>& args) {
+    if (args.size() != 1) {
+        client.write(RespWriter::error("wrong number of arguments for 'unwatch' command"));
+        return;
+    }
+    unwatch_client(client.fd);
+    client.write(RespWriter::ok());
+}
+
 void Server::execute_internal(Client& client, const vector<string>& args, bool from_master) {
     if (args.empty()) return;
 
     stats_.total_commands_processed++;
     string cmd = to_upper(args[0]);
 
+    // Handle transaction control commands directly (not queued)
+    if (cmd == "MULTI") {
+        cmd_multi(client, args);
+        return;
+    } else if (cmd == "EXEC") {
+        cmd_exec(client, args);
+        return;
+    } else if (cmd == "DISCARD") {
+        cmd_discard(client, args);
+        return;
+    } else if (cmd == "WATCH") {
+        cmd_watch(client, args);
+        return;
+    } else if (cmd == "UNWATCH") {
+        cmd_unwatch(client, args);
+        return;
+    }
+
+    // If client is currently within a MULTI block, queue the command
+    if (client.in_multi && !from_master) {
+        if (role_ == NodeRole::Replica && is_mutation_cmd(cmd)) {
+            client.dirty_exec = true;
+            client.write(RespWriter::error_with_code("READONLY", "You can't write against a read only replica."));
+            return;
+        }
+
+        auto arity = check_cmd_arity(args);
+        if (arity == ArityResult::Unknown) {
+            client.dirty_exec = true;
+            client.write(RespWriter::error("unknown command '" + args[0] + "'"));
+            return;
+        } else if (arity == ArityResult::WrongArity) {
+            client.dirty_exec = true;
+            string lower_cmd = args[0];
+            to_lower(lower_cmd);
+            client.write(RespWriter::error("wrong number of arguments for '" + lower_cmd + "' command"));
+            return;
+        }
+
+        client.multi_commands.push_back(args);
+        client.write(RespWriter::status("QUEUED"));
+        return;
+    }
+
+    dispatch_command(client, args, from_master);
+}
+
+void Server::dispatch_command(Client& client, const vector<string>& args, bool from_master) {
+    if (args.empty()) return;
+
+    string cmd = to_upper(args[0]);
+
     // Read-only replica guard
     if (role_ == NodeRole::Replica && !from_master) {
-        if (cmd == "SET" || cmd == "DEL" || cmd == "EXPIRE" || cmd == "ZADD") {
+        if (is_mutation_cmd(cmd)) {
             client.write(RespWriter::error_with_code("READONLY", "You can't write against a read only replica."));
             return;
         }
@@ -270,8 +537,7 @@ void Server::execute_internal(Client& client, const vector<string>& args, bool f
 
     // Propagate mutation to replicas if Master and not internal
     if (role_ == NodeRole::Master && client.fd != INVALID_SOCK && !from_master) {
-        if ((has_active_replication_ || !replicas_.empty()) &&
-            (cmd == "SET" || cmd == "DEL" || cmd == "EXPIRE" || cmd == "ZADD")) {
+        if ((has_active_replication_ || !replicas_.empty()) && is_mutation_cmd(cmd)) {
             propagate_to_replicas(args);
         }
     }
@@ -360,6 +626,7 @@ void Server::cmd_set(Client& client, const vector<string>& args) {
         aof_.append(args);
     }
 
+    touch_watched_key(key);
     client.write(RespWriter::ok());
 }
 
@@ -465,6 +732,7 @@ void Server::cmd_expire(Client& client, const vector<string>& args) {
 
     uint64_t expire_at = unix_time_ms() + (*sec * 1000);
     expire_.set_expire(entry, expire_at);
+    touch_watched_key(key);
 
     if (config_.aof_enabled && client.fd != INVALID_SOCK) {
         aof_.append(args);
@@ -561,6 +829,7 @@ void Server::cmd_zadd(Client& client, const vector<string>& args) {
         aof_.append(args);
     }
 
+    touch_watched_key(key);
     client.write(RespWriter::integer(added));
 }
 

@@ -5,6 +5,7 @@
 #include "evict.h"
 #include "expire.h"
 #include "replication.h"
+#include "server.h"
 #include <iostream>
 #include <cassert>
 #include <string>
@@ -391,6 +392,177 @@ void test_replication_backlog_model_check() {
     }
 }
 
+void test_transactions() {
+    redis::Config cfg;
+    cfg.aof_enabled = false;
+    redis::Server server(cfg);
+
+    redis::Client c1(INVALID_SOCK, "127.0.0.1", 10001);
+    redis::Client c2(INVALID_SOCK, "127.0.0.1", 10002);
+
+    // 1. Errors outside MULTI
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf.find("-ERR EXEC without MULTI") != string::npos);
+
+    c1.write_buf.clear();
+    server.execute(c1, {"DISCARD"});
+    assert(c1.write_buf.find("-ERR DISCARD without MULTI") != string::npos);
+
+    // 2. Empty MULTI/EXEC
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    assert(c1.write_buf == "+OK\r\n");
+    assert(c1.in_multi == true);
+
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf == "*0\r\n");
+    assert(c1.in_multi == false);
+
+    // 3. Normal MULTI / QUEUED / EXEC with multiple operations
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    assert(c1.write_buf == "+OK\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"SET", "txn_k1", "val1"});
+    assert(c1.write_buf == "+QUEUED\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"SET", "txn_k2", "val2"});
+    assert(c1.write_buf == "+QUEUED\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"GET", "txn_k1"});
+    assert(c1.write_buf == "+QUEUED\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"PING"});
+    assert(c1.write_buf == "+QUEUED\r\n");
+
+    // While c1 is in MULTI, keys should not be modified yet
+    assert(server.dict().find("txn_k1") == nullptr);
+
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    string expected_exec = "*4\r\n+OK\r\n+OK\r\n$4\r\nval1\r\n+PONG\r\n";
+    assert(c1.write_buf == expected_exec);
+    assert(server.dict().find("txn_k1") != nullptr);
+    assert(server.dict().find("txn_k1")->str() == "val1");
+
+    // 4. DISCARD test
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    assert(c1.write_buf == "+OK\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"SET", "txn_k1", "should_not_set"});
+    assert(c1.write_buf == "+QUEUED\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"DISCARD"});
+    assert(c1.write_buf == "+OK\r\n");
+    assert(c1.in_multi == false);
+    assert(server.dict().find("txn_k1")->str() == "val1");
+
+    // 5. Nested MULTI causes EXECABORT
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    assert(c1.write_buf == "+OK\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    assert(c1.write_buf.find("-ERR MULTI calls can not be nested") != string::npos);
+    assert(c1.dirty_exec == true);
+
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf.find("-EXECABORT") != string::npos);
+    assert(c1.in_multi == false);
+
+    // 6. Queue-time error (wrong arity) causes EXECABORT
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    assert(c1.write_buf == "+OK\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"SET"});
+    assert(c1.write_buf.find("-ERR wrong number of arguments") != string::npos);
+    assert(c1.dirty_exec == true);
+
+    c1.write_buf.clear();
+    server.execute(c1, {"SET", "aborted_key", "aborted_val"});
+    assert(c1.write_buf == "+QUEUED\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf.find("-EXECABORT") != string::npos);
+    assert(server.dict().find("aborted_key") == nullptr);
+
+    // 7. Runtime error does NOT abort subsequent commands
+    server.execute(c1, {"SET", "str_key", "my_string"});
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    server.execute(c1, {"SET", "ok_key1", "val1"});
+    server.execute(c1, {"ZADD", "str_key", "1.0", "member1"}); // runtime WRONGTYPE
+    server.execute(c1, {"SET", "ok_key2", "val2"});
+
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf.find("+OK\r\n-WRONGTYPE") != string::npos);
+    assert(server.dict().find("ok_key1") != nullptr);
+    assert(server.dict().find("ok_key2") != nullptr);
+
+    // 8. WATCH / UNWATCH optimistic locking with mock socket fds
+    c1.fd = 101;
+    c2.fd = 102;
+    server.execute(c1, {"SET", "watched_key", "initial"});
+
+    c1.write_buf.clear();
+    server.execute(c1, {"WATCH", "watched_key"});
+    assert(c1.write_buf == "+OK\r\n");
+
+    c2.write_buf.clear();
+    server.execute(c2, {"SET", "watched_key", "modified_by_c2"});
+    assert(c2.write_buf == "+OK\r\n");
+
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    server.execute(c1, {"SET", "watched_key", "c1_txn_val"});
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf == "$-1\r\n");
+    assert(server.dict().find("watched_key")->str() == "modified_by_c2");
+
+    // 9. UNWATCH before modification allows EXEC to succeed
+    server.execute(c1, {"WATCH", "watched_key"});
+    server.execute(c1, {"UNWATCH"});
+
+    server.execute(c2, {"SET", "watched_key", "modified_again"});
+
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    server.execute(c1, {"SET", "watched_key", "c1_success"});
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf == "*1\r\n+OK\r\n");
+    assert(server.dict().find("watched_key")->str() == "c1_success");
+
+    // 10. WATCH inside MULTI is rejected and aborts
+    c1.write_buf.clear();
+    server.execute(c1, {"MULTI"});
+    server.execute(c1, {"WATCH", "watched_key"});
+    assert(c1.write_buf.find("-ERR WATCH inside MULTI is not allowed") != string::npos);
+    c1.write_buf.clear();
+    server.execute(c1, {"EXEC"});
+    assert(c1.write_buf.find("-EXECABORT") != string::npos);
+
+    // Reset fds to INVALID_SOCK so Client destructor doesn't call closesocket on fake fds
+    c1.fd = INVALID_SOCK;
+    c2.fd = INVALID_SOCK;
+}
+
 int main() {
     test_common();
     cout << "[PASS] Common" << endl;
@@ -415,6 +587,9 @@ int main() {
 
     test_replication_backlog_model_check();
     cout << "[PASS] Replication Backlog Randomized Model Check (5000 iterations vs std::string)" << endl;
+
+    test_transactions();
+    cout << "[PASS] Transactions (MULTI, EXEC, DISCARD, WATCH, UNWATCH, EXECABORT)" << endl;
 
     cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY!" << endl;
     return 0;

@@ -322,3 +322,67 @@ void ReplicationBacklog::feed(const std::string& data) {
 ```
 *Key invariant*: Zero memory movements (`memmove` or reallocations) occur during ingestion; every write is decomposed into at most two fixed-size `memcpy` calls.
 
+---
+
+## 6. Transaction Engine & Optimistic Locking (`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`)
+
+### 6.1 Transaction Lifecycle & State Machine
+RedisClone implements the Redis transaction subsystem supporting atomic command batching and optimistic concurrency control (OCC). A client transitions through distinct states:
+
+```
+                  +--------------------------------+
+                  |           Normal State         |
+                  +---------------+----------------+
+                                  |
+                                  | MULTI
+                                  v
++------------------->+--------------------------------+<-------------------+
+|                    |          in_multi = true       |                    |
+|                    +---------------+----------------+                    |
+|                                    |                                     |
+|           +------------------------+------------------------+            |
+|           |                                                 |            |
+|           | Valid Command                                   | Syntax/    |
+|           v (+QUEUED)                                       v Arity Err  |
+|   +---------------+                                 +---------------+    |
+|   | multi_commands|                                 | dirty_exec = 1|----+
+|   |  .push_back() |                                 | (-ERR ...)    |
+|   +-------+-------+                                 +-------+-------+
+|           |                                                 |
+|           +------------------------+------------------------+
+|                                    |
+|                   +----------------+----------------+
+|                   |                                 |
+|                   | EXEC                            | DISCARD
+|                   v                                 v
+|       +-----------------------+             +---------------+
+|       | dirty_exec?           |             | reset_txn()   |
+|       | -> -EXECABORT         |             | unwatch()     |
+|       |                       |             | (+OK)         |
+|       | watch_dirty?          |             +-------+-------+
+|       | -> $-1 (nil)          |                     |
+|       |                       |                     v
+|       | execute commands      |             +---------------+
+|       | return RESP Array     |             | Normal State  |
+|       +-----------+-----------+             +---------------+
+|                   |
+|                   v
+|           +---------------+
+|           | Normal State  |
++-----------+---------------+
+```
+
+### 6.2 Key Architectural Decisions
+1. **Zero-Copy Response Aggregation (`write_target`)**:
+   Instead of buffering intermediate RESP objects in secondary vectors or allocating mock client instances, each client possesses a `std::string* write_target{nullptr}` pointer. When `EXEC` executes queued commands, `write_target` redirects command outputs directly into an execution body buffer. Prepending the RESP array header (`*<N>\r\n`) delivers the entire transaction response in a single contiguous write without re-parsing or redundant allocations.
+
+2. **Strict Queue-Time Validation & `EXECABORT`**:
+   Commands queued during `MULTI` undergo arity and command existence checks. If a syntax error occurs (such as missing arguments), the transaction flags `dirty_exec = true`. When `EXEC` is invoked, the entire transaction is aborted with `-EXECABORT Transaction discarded because of previous errors.`, ensuring no malformed operations execute.
+
+3. **Runtime Error Non-Abort Semantics**:
+   Consistent with standard Redis specifications, runtime errors (e.g., executing `ZADD` against a string key, yielding `-WRONGTYPE`) do not abort preceding or subsequent queued commands. The error is captured as an element within the output RESP array, and all other commands commit atomically.
+
+4. **Optimistic Locking (`WATCH` / `UNWATCH`)**:
+   Keys registered with `WATCH` are tracked in a reverse mapping (`watched_keys_`) mapping each watched key to the set of watching client sockets. Whenever a mutating command (`SET`, `DEL`, `EXPIRE`, `ZADD`) or eviction/expiration modifies a key, `touch_watched_key(key)` marks all watching clients as `client_watch_dirty_ = true`. If dirty when `EXEC` is called, the transaction aborts and returns `$-1\r\n` (null multi-bulk). All watches automatically release upon transaction completion (`EXEC`/`DISCARD`) or client disconnection.
+
+

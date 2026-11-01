@@ -16,6 +16,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace redis {
 
@@ -116,6 +117,18 @@ private:
     void cmd_info(Client& client, const std::vector<std::string>& args);
     void cmd_command(Client& client, const std::vector<std::string>& args);
 
+    // Transaction Commands
+    void cmd_multi(Client& client, const std::vector<std::string>& args);
+    void cmd_exec(Client& client, const std::vector<std::string>& args);
+    void cmd_discard(Client& client, const std::vector<std::string>& args);
+    void cmd_watch(Client& client, const std::vector<std::string>& args);
+    void cmd_unwatch(Client& client, const std::vector<std::string>& args);
+
+    void dispatch_command(Client& client, const std::vector<std::string>& args, bool from_master);
+    void touch_watched_key(const std::string& key);
+    bool is_watch_dirty(socket_t fd) const;
+    void unwatch_client(socket_t fd);
+
     // Replication Commands
     void cmd_replicaof(Client& client, const std::vector<std::string>& args);
     void cmd_wait(Client& client, const std::vector<std::string>& args);
@@ -128,6 +141,11 @@ private:
 
     size_t estimate_size(const std::string& key, const std::string& val);
     size_t estimate_size(const std::string& key, const Value& value);
+
+    // Transaction WATCH state
+    std::unordered_map<std::string, std::unordered_set<socket_t>> watched_keys_;
+    std::unordered_map<socket_t, std::unordered_set<std::string>> client_watched_keys_;
+    std::unordered_map<socket_t, bool> client_watch_dirty_;
 };
 
 }
