@@ -1,151 +1,182 @@
 #!/usr/bin/env python3
 """
-Automated 5-Run Benchmark Runner
-Pins server to Core 2 and redis-benchmark to Cores 3,4 using taskset.
-Identical flags: -c 50 -P 16 -n 1000000 -t set,get
-Saves all raw outputs to benchmark/results/ and calculates exact medians.
+Automated 5-Run Interleaved Benchmark Suite
+Tests RedisClone vs Official Redis 7.0 back-to-back in the exact same session.
+Configurations:
+  1. Standard Key: redis-benchmark -c 50 -P 16 -n 1000000 -t set,get
+  2. Random 1M Keyspace: redis-benchmark -c 50 -P 16 -n 1000000 -r 1000000 -t set,get
+Both servers run in-memory (--aof no and --appendonly no --save "").
+Pinned with taskset (server on core 2, benchmark on cores 3,4 if available).
 """
 
 import subprocess
 import time
 import os
+import sys
 import re
 import statistics
 
 RESULTS_DIR = "benchmark/results"
-FLAGS = ["-c", "50", "-P", "16", "-n", "1000000", "-t", "set,get"]
 RUNS = 5
+N_REQUESTS = 1_000_000
+CLIENTS = 50
+PIPELINE = 16
 
 def parse_benchmark_output(text):
     results = {}
     current_test = None
-    
+
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("====== ") and line.endswith(" ======"):
             current_test = line.replace("=", "").strip().upper()
             results[current_test] = {}
         elif current_test:
-            # Match RPS: e.g., "throughput summary: 726253.12 requests per second" or "726253.12 requests per second"
             m_rps = re.search(r"([\d\.]+)\s+requests per second", line)
             if m_rps:
                 results[current_test]["rps"] = float(m_rps.group(1))
-            # Match p50 and p99: e.g., "50.000% <= 0.039 milliseconds" or "p50=0.039"
             m_p50 = re.search(r"50(?:\.0+)?%\s+<=\s+([\d\.]+)\s+milliseconds", line)
             if m_p50:
                 results[current_test]["p50"] = float(m_p50.group(1))
             m_p99 = re.search(r"99(?:\.0+)?%\s+<=\s+([\d\.]+)\s+milliseconds", line)
             if m_p99:
                 results[current_test]["p99"] = float(m_p99.group(1))
-                
+
     return results
 
-def run_suite(server_name, start_cmd, port):
-    print(f"\n=======================================================")
-    print(f"  Benchmarking {server_name} on Port {port} (5 Runs, Pinned with taskset)")
-    print(f"=======================================================")
-    
-    runs_data = []
+def run_single_test(server_cmd, port, bench_extra_flags, log_filename):
+    # Kill any lingering instances
+    subprocess.run(["pkill", "-9", "-f", "redis-server"], stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
 
-    for run_idx in range(1, RUNS + 1):
-        # Kill any lingering instances
-        subprocess.run(["killall", "-9", "redis-server"], stderr=subprocess.DEVNULL)
-        time.sleep(0.5)
+    # Detect if taskset is available
+    has_taskset = subprocess.run(["which", "taskset"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
-        # Start server pinned to Core 2
-        server_proc = subprocess.Popen(["taskset", "-c", "2"] + start_cmd)
-        time.sleep(1.0)
+    server_prefix = ["taskset", "-c", "2"] if has_taskset else []
+    bench_prefix = ["taskset", "-c", "3,4"] if has_taskset else []
 
-        # Run redis-benchmark pinned to Cores 3,4
-        bench_cmd = ["taskset", "-c", "3,4", "redis-benchmark", "-h", "127.0.0.1", "-p", str(port)] + FLAGS
-        print(f"[{server_name}] Run {run_idx}/{RUNS} executing: {' '.join(bench_cmd)}...")
-        
-        proc = subprocess.run(bench_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        raw_output = proc.stdout
-        
-        # Save raw output
-        filename = f"{server_name.lower().replace(' ', '')}_run_{run_idx}.txt"
-        filepath = os.path.join(RESULTS_DIR, filename)
-        with open(filepath, "w") as f:
-            f.write(raw_output)
+    server_proc = subprocess.Popen(server_prefix + server_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)
 
-        parsed = parse_benchmark_output(raw_output)
-        runs_data.append(parsed)
+    bench_cmd = bench_prefix + [
+        "redis-benchmark", "-h", "127.0.0.1", "-p", str(port),
+        "-c", str(CLIENTS), "-P", str(PIPELINE), "-n", str(N_REQUESTS),
+        "-t", "set,get"
+    ] + bench_extra_flags
 
-        set_rps = parsed.get("SET", {}).get("rps", 0)
-        get_rps = parsed.get("GET", {}).get("rps", 0)
-        print(f"  -> Run {run_idx}: SET = {set_rps:,.0f} ops/sec, GET = {get_rps:,.0f} ops/sec")
+    proc = subprocess.run(bench_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    raw_output = proc.stdout
 
-        server_proc.terminate()
-        server_proc.wait()
-        time.sleep(0.5)
+    filepath = os.path.join(RESULTS_DIR, log_filename)
+    with open(filepath, "w") as f:
+        f.write(raw_output)
 
-    return runs_data
+    server_proc.terminate()
+    try:
+        server_proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        server_proc.kill()
+    time.sleep(0.3)
+
+    parsed = parse_benchmark_output(raw_output)
+    return parsed
 
 def summarize(name, runs_data):
-    set_rps_list = [r["SET"]["rps"] for r in runs_data if "SET" in r and "rps" in r["SET"]]
-    get_rps_list = [r["GET"]["rps"] for r in runs_data if "GET" in r and "rps" in r["GET"]]
-    set_p50_list = [r["SET"]["p50"] for r in runs_data if "SET" in r and "p50" in r["SET"]]
-    set_p99_list = [r["SET"]["p99"] for r in runs_data if "SET" in r and "p99" in r["SET"]]
-    get_p50_list = [r["GET"]["p50"] for r in runs_data if "GET" in r and "p50" in r["GET"]]
-    get_p99_list = [r["GET"]["p99"] for r in runs_data if "GET" in r and "p99" in r["GET"]]
+    def get_metric(cmd, metric):
+        vals = [r[cmd][metric] for r in runs_data if cmd in r and metric in r[cmd]]
+        return statistics.median(vals) if vals else 0.0
 
     return {
         "name": name,
-        "set_rps_median": statistics.median(set_rps_list) if set_rps_list else 0,
-        "set_p50_median": statistics.median(set_p50_list) if set_p50_list else 0,
-        "set_p99_median": statistics.median(set_p99_list) if set_p99_list else 0,
-        "get_rps_median": statistics.median(get_rps_list) if get_rps_list else 0,
-        "get_p50_median": statistics.median(get_p50_list) if get_p50_list else 0,
-        "get_p99_median": statistics.median(get_p99_list) if get_p99_list else 0,
+        "set_rps": get_metric("SET", "rps"),
+        "set_p50": get_metric("SET", "p50"),
+        "set_p99": get_metric("SET", "p99"),
+        "get_rps": get_metric("GET", "rps"),
+        "get_p50": get_metric("GET", "p50"),
+        "get_p99": get_metric("GET", "p99"),
     }
 
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # 1. Official Redis 7.0
-    redis_runs = run_suite(
-        "Redis",
-        ["/usr/bin/redis-server", "--port", "6380", "--save", "", "--appendonly", "no", "--protected-mode", "no"],
-        6380
-    )
+    redis_cmd = ["/usr/bin/redis-server", "--port", "6380", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
+    clone_cmd = ["./redis-server", "-p", "6379", "--aof", "no"]
 
-    # 2. RedisClone
-    clone_runs = run_suite(
-        "RedisClone",
-        ["./redis-server", "-p", "6379", "--aof", "no"],
-        6379
-    )
+    redis_std_runs = []
+    clone_std_runs = []
+    redis_rand_runs = []
+    clone_rand_runs = []
 
-    s_redis = summarize("Official Redis 7.0", redis_runs)
-    s_clone = summarize("RedisClone", clone_runs)
-
-    set_pct = (s_clone["set_rps_median"] / s_redis["set_rps_median"] * 100.0) if s_redis["set_rps_median"] > 0 else 0
-    get_pct = (s_clone["get_rps_median"] / s_redis["get_rps_median"] * 100.0) if s_redis["get_rps_median"] > 0 else 0
-
-    print("\n==========================================================================================")
-    print("                       BENCHMARK SUMMARY (5-RUN MEDIANS)")
     print("==========================================================================================")
-    print(f"{'Target':<20} | {'SET QPS':<14} | {'SET p50':<10} | {'SET p99':<10} | {'GET QPS':<14} | {'GET p50':<10} | {'GET p99':<10}")
-    print("-" * 105)
-    print(f"{s_redis['name']:<20} | {s_redis['set_rps_median']:<14,.0f} | {s_redis['set_p50_median']:<8.3f}ms | {s_redis['set_p99_median']:<8.3f}ms | {s_redis['get_rps_median']:<14,.0f} | {s_redis['get_p50_median']:<8.3f}ms | {s_redis['get_p99_median']:<8.3f}ms")
-    print(f"{s_clone['name']:<20} | {s_clone['set_rps_median']:<14,.0f} | {s_clone['set_p50_median']:<8.3f}ms | {s_clone['set_p99_median']:<8.3f}ms | {s_clone['get_rps_median']:<14,.0f} | {s_clone['get_p50_median']:<8.3f}ms | {s_clone['get_p99_median']:<8.3f}ms")
-    print("-" * 105)
-    print(f"Honest Performance Relative to Official Redis: SET = {set_pct:.1f}%, GET = {get_pct:.1f}%")
+    print("  Executing 5-Run Interleaved Benchmark Suite (n = 1,000,000, P = 16, c = 50)")
     print("==========================================================================================")
+
+    for run_idx in range(1, RUNS + 1):
+        print(f"\n--- Iteration {run_idx}/{RUNS} ---")
+
+        # 1. Official Redis (Standard Key)
+        print(f"  [1/4] Redis 7.0 (Standard Key)...")
+        r_std = run_single_test(redis_cmd, 6380, [], f"redis_std_run_{run_idx}.txt")
+        redis_std_runs.append(r_std)
+        print(f"        -> SET: {r_std.get('SET',{}).get('rps',0):,.0f} ops/s, GET: {r_std.get('GET',{}).get('rps',0):,.0f} ops/s")
+
+        # 2. RedisClone (Standard Key)
+        print(f"  [2/4] RedisClone (Standard Key)...")
+        c_std = run_single_test(clone_cmd, 6379, [], f"redisclone_std_run_{run_idx}.txt")
+        clone_std_runs.append(c_std)
+        print(f"        -> SET: {c_std.get('SET',{}).get('rps',0):,.0f} ops/s, GET: {c_std.get('GET',{}).get('rps',0):,.0f} ops/s")
+
+        # 3. Official Redis (Random 1M Keyspace)
+        print(f"  [3/4] Redis 7.0 (Random 1M Keyspace: -r 1000000)...")
+        r_rand = run_single_test(redis_cmd, 6380, ["-r", "1000000"], f"redis_rand_run_{run_idx}.txt")
+        redis_rand_runs.append(r_rand)
+        print(f"        -> SET: {r_rand.get('SET',{}).get('rps',0):,.0f} ops/s, GET: {r_rand.get('GET',{}).get('rps',0):,.0f} ops/s")
+
+        # 4. RedisClone (Random 1M Keyspace)
+        print(f"  [4/4] RedisClone (Random 1M Keyspace: -r 1000000)...")
+        c_rand = run_single_test(clone_cmd, 6379, ["-r", "1000000"], f"redisclone_rand_run_{run_idx}.txt")
+        clone_rand_runs.append(c_rand)
+        print(f"        -> SET: {c_rand.get('SET',{}).get('rps',0):,.0f} ops/s, GET: {c_rand.get('GET',{}).get('rps',0):,.0f} ops/s")
+
+    s_r_std = summarize("Official Redis 7.0 (Std)", redis_std_runs)
+    s_c_std = summarize("RedisClone (Std)", clone_std_runs)
+    s_r_rand = summarize("Official Redis 7.0 (Rand 1M)", redis_rand_runs)
+    s_c_rand = summarize("RedisClone (Rand 1M)", clone_rand_runs)
+
+    std_set_pct = (s_c_std["set_rps"] / s_r_std["set_rps"] * 100.0) if s_r_std["set_rps"] > 0 else 0
+    std_get_pct = (s_c_std["get_rps"] / s_r_std["get_rps"] * 100.0) if s_r_std["get_rps"] > 0 else 0
+    rand_set_pct = (s_c_rand["set_rps"] / s_r_rand["set_rps"] * 100.0) if s_r_rand["set_rps"] > 0 else 0
+    rand_get_pct = (s_c_rand["get_rps"] / s_r_rand["get_rps"] * 100.0) if s_r_rand["get_rps"] > 0 else 0
+
+    print("\n" + "=" * 115)
+    print("                                      MEASURED BENCHMARK SUMMARY (5-RUN MEDIANS)")
+    print("=" * 115)
+    print(f"{'Target':<30} | {'SET QPS':<14} | {'SET p50':<9} | {'SET p99':<9} | {'GET QPS':<14} | {'GET p50':<9} | {'GET p99':<9}")
+    print("-" * 115)
+    for s in [s_r_std, s_c_std, s_r_rand, s_c_rand]:
+        print(f"{s['name']:<30} | {s['set_rps']:<14,.0f} | {s['set_p50']:<7.3f}ms | {s['set_p99']:<7.3f}ms | {s['get_rps']:<14,.0f} | {s['get_p50']:<7.3f}ms | {s['get_p99']:<7.3f}ms")
+    print("-" * 115)
+    print(f"Standard Workload Comparison:    SET = {std_set_pct:.1f}% of Redis, GET = {std_get_pct:.1f}% of Redis")
+    print(f"Random 1M Keyspace Comparison:   SET = {rand_set_pct:.1f}% of Redis, GET = {rand_get_pct:.1f}% of Redis")
+    print("=" * 115)
 
     # Save summary markdown
-    with open(os.path.join(RESULTS_DIR, "benchmark_summary.md"), "w") as f:
+    summary_path = os.path.join(RESULTS_DIR, "benchmark_summary.md")
+    with open(summary_path, "w") as f:
         f.write("# Measured Benchmark Summary: RedisClone vs Redis 7.0\n\n")
-        f.write("- **Methodology**: 5 runs per target, median reported.\n")
-        f.write("- **Flags**: `redis-benchmark -c 50 -P 16 -n 1000000 -t set,get`\n")
-        f.write("- **Affinity**: Server pinned to Core 2, benchmark client pinned to Cores 3,4 via `taskset`.\n")
-        f.write("- **Host**: WSL2 Debian on AMD/Intel multi-core processor.\n\n")
-        f.write("| Engine | SET Throughput (ops/sec) | SET p50 | SET p99 | GET Throughput (ops/sec) | GET p50 | GET p99 |\n")
-        f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
-        f.write(f"| **Redis 7.0** | {s_redis['set_rps_median']:,.0f} | {s_redis['set_p50_median']:.3f} ms | {s_redis['set_p99_median']:.3f} ms | {s_redis['get_rps_median']:,.0f} | {s_redis['get_p50_median']:.3f} ms | {s_redis['get_p99_median']:.3f} ms |\n")
-        f.write(f"| **RedisClone** | {s_clone['set_rps_median']:,.0f} | {s_clone['set_p50_median']:.3f} ms | {s_clone['set_p99_median']:.3f} ms | {s_clone['get_rps_median']:,.0f} | {s_clone['get_p50_median']:.3f} ms | {s_clone['get_p99_median']:.3f} ms |\n\n")
-        f.write(f"RedisClone achieves **{set_pct:.1f}%** of official Redis SET throughput and **{get_pct:.1f}%** of GET throughput under identical taskset pinned conditions.\n")
+        f.write("- **Methodology**: 5 interleaved runs per target, median reported.\n")
+        f.write("- **Flags**: `redis-benchmark -c 50 -P 16 -n 1000000 -t set,get` (with and without `-r 1000000`)\n")
+        f.write("- **Environment**: Identical single session, both in-memory without AOF (`--aof no` vs `--appendonly no --save \"\"`).\n")
+        f.write("- **Affinity**: Server pinned to Core 2, benchmark client pinned to Cores 3,4 via `taskset`.\n\n")
+        f.write("| Workload | Engine | SET Throughput (ops/sec) | SET p50 | SET p99 | GET Throughput (ops/sec) | GET p50 | GET p99 |\n")
+        f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+        f.write(f"| Standard Key | **Redis 7.0** | {s_r_std['set_rps']:,.0f} | {s_r_std['set_p50']:.3f} ms | {s_r_std['set_p99']:.3f} ms | {s_r_std['get_rps']:,.0f} | {s_r_std['get_p50']:.3f} ms | {s_r_std['get_p99']:.3f} ms |\n")
+        f.write(f"| Standard Key | **RedisClone** | {s_c_std['set_rps']:,.0f} | {s_c_std['set_p50']:.3f} ms | {s_c_std['set_p99']:.3f} ms | {s_c_std['get_rps']:,.0f} | {s_c_std['get_p50']:.3f} ms | {s_c_std['get_p99']:.3f} ms |\n")
+        f.write(f"| Random 1M Keys | **Redis 7.0** | {s_r_rand['set_rps']:,.0f} | {s_r_rand['set_p50']:.3f} ms | {s_r_rand['set_p99']:.3f} ms | {s_r_rand['get_rps']:,.0f} | {s_r_rand['get_p50']:.3f} ms | {s_r_rand['get_p99']:.3f} ms |\n")
+        f.write(f"| Random 1M Keys | **RedisClone** | {s_c_rand['set_rps']:,.0f} | {s_c_rand['set_p50']:.3f} ms | {s_c_rand['set_p99']:.3f} ms | {s_c_rand['get_rps']:,.0f} | {s_c_rand['get_p50']:.3f} ms | {s_c_rand['get_p99']:.3f} ms |\n\n")
+        f.write(f"### Performance Relative to Official Redis 7.0\n")
+        f.write(f"- **Standard Key Workload**: SET = **{std_set_pct:.1f}%**, GET = **{std_get_pct:.1f}%**\n")
+        f.write(f"- **Random 1M Keyspace Workload**: SET = **{rand_set_pct:.1f}%**, GET = **{rand_get_pct:.1f}%**\n")
 
 if __name__ == "__main__":
     main()

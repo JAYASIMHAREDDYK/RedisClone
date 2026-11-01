@@ -129,32 +129,46 @@ void Dict::rehash_ms(int ms) {
     }
 }
 
-bool Dict::set(const string& key, Value val) {
+bool Dict::set(const string& key, Value val, Entry** out_entry) {
     if (is_rehashing()) {
         step_rehash(1);
     }
 
-    Entry* existing = find(key);
-    if (existing) {
-        existing->value = std::move(val);
-        existing->last_accessed_time = unix_time_sec();
-        if (existing->frequency < 0xFFFFFFFF) {
-            existing->frequency++;
+    uint64_t h = hash_key(key);
+    for (int table_idx = 0; table_idx <= 1; ++table_idx) {
+        Table& t = ht[table_idx];
+        if (t.size == 0) continue;
+
+        size_t idx = h & t.sizemask;
+        Entry* curr = t.table[idx];
+        while (curr) {
+            if (curr->key == key) {
+                curr->value = std::move(val);
+                curr->last_accessed_time = unix_time_sec();
+                if (curr->frequency < 0xFFFFFFFF) {
+                    curr->frequency++;
+                }
+                if (out_entry) *out_entry = curr;
+                return false;
+            }
+            curr = curr->next;
         }
-        return false;
+
+        if (!is_rehashing()) break;
     }
 
     expand_if_needed();
 
     // New keys are placed into ht[1] during rehash so ht[0] continuously drains
     Table* target = is_rehashing() ? &ht[1] : &ht[0];
-    size_t idx = hash_key(key) & target->sizemask;
+    size_t idx = h & target->sizemask;
 
     auto* entry = new Entry(key, std::move(val));
     entry->next = target->table[idx];
     target->table[idx] = entry;
     target->used++;
 
+    if (out_entry) *out_entry = entry;
     return true;
 }
 

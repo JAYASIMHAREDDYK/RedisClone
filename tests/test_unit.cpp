@@ -4,6 +4,7 @@
 #include "resp.h"
 #include "evict.h"
 #include "expire.h"
+#include "replication.h"
 #include <iostream>
 #include <cassert>
 #include <string>
@@ -210,6 +211,61 @@ void test_expire() {
     assert(expirer.ttl_sec(&e) == -2);
 }
 
+void test_replication_backlog() {
+    string my_id = "test_repl_id";
+
+    // 1. Basic feed and read
+    redis::ReplicationBacklog backlog(100);
+    backlog.feed("hello");
+    assert(backlog.master_offset() == 5);
+    assert(backlog.start_offset() == 0);
+    assert(backlog.size() == 5);
+    assert(backlog.get_data(0) == "hello");
+
+    // 2. Wraparound
+    string data1(80, 'A');
+    backlog.feed(data1); // master_offset = 85, size = 85
+    assert(backlog.master_offset() == 85);
+    assert(backlog.start_offset() == 0);
+
+    string data2(30, 'B');
+    backlog.feed(data2); // total fed = 115 > max_size 100
+    assert(backlog.master_offset() == 115);
+    assert(backlog.size() == 100);
+    assert(backlog.start_offset() == 15); // 115 - 100
+
+    string read_all = backlog.get_data(15);
+    assert(read_all.size() == 100);
+    assert(read_all == string(70, 'A') + string(30, 'B'));
+
+    // 3. Offset exactly at the window edge (start_offset)
+    assert(backlog.can_partial_resync(my_id, 15, my_id) == true);
+    assert(backlog.get_data(15).size() == 100);
+
+    // Offset exactly at master_offset
+    assert(backlog.can_partial_resync(my_id, 115, my_id) == true);
+    assert(backlog.get_data(115) == "");
+
+    // 4. Offset one byte outside the window edge (must reject / force full resync)
+    assert(backlog.can_partial_resync(my_id, 14, my_id) == false);
+    assert(backlog.get_data(14) == "");
+    assert(backlog.can_partial_resync(my_id, -1, my_id) == false);
+
+    // 5. Payload larger than the entire buffer
+    redis::ReplicationBacklog backlog_large(50);
+    string oversized(120, 'X');
+    for (int i = 100; i < 120; ++i) oversized[i] = 'Y';
+    backlog_large.feed(oversized);
+
+    assert(backlog_large.master_offset() == 120);
+    assert(backlog_large.size() == 50);
+    assert(backlog_large.start_offset() == 70); // 120 - 50
+
+    string read_oversized = backlog_large.get_data(70);
+    assert(read_oversized.size() == 50);
+    assert(read_oversized == string(30, 'X') + string(20, 'Y'));
+}
+
 int main() {
     test_common();
     cout << "[PASS] Common" << endl;
@@ -228,6 +284,9 @@ int main() {
 
     test_expire();
     cout << "[PASS] Expirer" << endl;
+
+    test_replication_backlog();
+    cout << "[PASS] Replication Backlog Ring Buffer (wraparound, edge, outside, oversized)" << endl;
 
     cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY!" << endl;
     return 0;

@@ -74,7 +74,7 @@ public:
     void step_rehash(int n = 1);
     void rehash_ms(int ms);
 
-    bool set(const std::string& key, Value val);
+    bool set(const std::string& key, Value val, Entry** out_entry = nullptr);
     Entry* find(std::string_view key);
     bool erase(std::string_view key);
 

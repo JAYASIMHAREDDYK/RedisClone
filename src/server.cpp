@@ -320,8 +320,8 @@ void Server::cmd_set(Client& client, const vector<string>& args) {
         }
     }
 
-    bool is_new = dict_.set(key, val);
-    Entry* entry = dict_.find(key);
+    Entry* entry = nullptr;
+    bool is_new = dict_.set(key, val, &entry);
     if (entry) {
         if (is_new) {
             stats_.used_memory_bytes += estimate_size(key, val);

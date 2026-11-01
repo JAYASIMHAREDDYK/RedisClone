@@ -45,6 +45,10 @@ jobs:
       run: |
         python3 tests/test_replication.py
 
+    - name: Throughput Regression Smoke Check
+      run: |
+        python3 benchmark/ci_regression_smoke.py
+
   sanitizer-and-fuzz:
     name: ASan / UBSan & libFuzzer Run
     runs-on: ubuntu-latest

@@ -158,4 +158,53 @@ When the replica is promoted via `REPLICAOF NO ONE`, those acknowledged writes a
 
 ### Q8: How does the WAIT command prevent write loss?
 **Answer**:
-The `WAIT <numreplicas> <timeout_ms>` command introduces a semi-synchronous replication barrier. The client sends a write followed by `WAIT 1 1000`. The primary sends `REPLCONF GETACK *` to the replica and pauses returning to the client until the replica explicitly acknowledges having received and applied all byte offsets up to the write's replication offset. When testing failover with `WAIT 1 1000`, **0 of 300 acknowledged writes were lost (0.00% data loss)**.
+The `WAIT <numreplicas> <timeout_ms>` command introduces a semi-synchronous replication barrier. The client sends a write followed by `WAIT 1 1000`. The primary sends `REPLCONF GETACK *` to the replica and pauses returning to the client until the replica explicitly acknowledges having received and applied all byte offsets up to the write's replication offset.
+
+When testing failover with `WAIT 1 1000`, **0 of 300 acknowledged writes were lost (0.00% data loss)** when promoting the synchronized replica.
+*Caveat*: `WAIT` guarantees zero acknowledged write loss **only if the acknowledging replica is the one promoted**. If an out-of-date or partitioned replica is elected, writes can still be lost.
+*Workload Difference*: The async test executed 10,000 writes to measure high-throughput async pipeline drainage under mid-stream `SIGKILL`. The `WAIT` test executed 300 writes because each batch incurred a synchronous round-trip acknowledgment barrier (~1.2 ms network RTT latency per batch), illustrating the classic latency-durability trade-off.
+
+---
+
+## 4. Performance Investigation: The 29x SET Regression
+
+### 4.1 Symptom
+Following the integration of primary-replica streaming replication, pipelined `SET` throughput suffered a severe regression, collapsing from over 800,000 ops/sec down to **41,494 ops/sec**, with p50 latency ballooning from 0.032 ms to **26.815 ms** and p99 to **57.119 ms**. In contrast, `GET` throughput remained high (~1.8M ops/sec), indicating the regression was isolated to mutating commands.
+
+### 4.2 Investigation Methodology
+1. **Git Bisect**: Running automated benchmarks at each bisect step isolated the regression to the commit introducing the `ReplicationBacklog` buffer.
+2. **Profiling (`perf record` / `strace -c`)**:
+   - `strace -c` confirmed that system calls (`write`, `epoll_wait`) were not blocking (less than 3% of elapsed execution time).
+   - `perf record -g` / flame graph analysis revealed that over **95% of on-CPU execution time** was concentrated inside glibc `__memmove_avx_unaligned_erms`, invoked by `std::string::erase(0, overflow)` on every mutating command.
+
+### 4.3 Root Cause Analysis
+The replication backlog was initially implemented as a dynamically appended `std::string`:
+```cpp
+// Defective implementation:
+void ReplicationBacklog::feed(const std::string& raw_resp) {
+    buffer_.append(raw_resp);
+    master_offset_ += raw_resp.size();
+    if (buffer_.size() > max_size_) {
+        size_t overflow = buffer_.size() - max_size_;
+        buffer_.erase(0, overflow); // <-- 1MB memmove on EVERY mutation!
+    }
+}
+```
+As soon as the backlog reached its 1MB capacity (`max_size_ = 1024 * 1024`), every single 50-byte `SET` command called `buffer_.erase(0, overflow)`. This caused an in-memory `memmove` of **1,048,576 bytes per query** on the reactor thread, saturating system memory bus bandwidth at ~43 GB/s.
+
+Additionally, `Server::cmd_set` performed a redundant second hash lookup: calling `dict_.set(key, val)` followed immediately by `dict_.find(key)`, duplicating hash computation and bucket traversals.
+
+### 4.4 Resolution
+1. **Circular Ring Buffer**: Refactored `ReplicationBacklog` to a preallocated `std::vector<char>` ring buffer indexed modulo `max_size_`. Appending new bytes is now strictly $O(\text{payload})$, writing into the buffer via 1 or 2 small `memcpy` operations with **zero `memmove` overhead**.
+2. **Single-Pass Hash & Insert**: Refactored `Dict::set(key, val, &out_entry)` to return the created or updated `Entry*` directly from the initial hash traversal, eliminating the redundant `dict_.find()` call.
+
+### 4.5 Before vs. After Benchmark Comparison
+Identical benchmark configuration (`redis-benchmark -c 50 -P 16 -n 1000000 -t set` without AOF):
+
+| Metric | Defective Backlog (`std::string::erase`) | Circular Ring Buffer + Single-Pass Dict | Speedup |
+| :--- | :---: | :---: | :---: |
+| **SET Throughput** | 41,494 ops/sec | **1,204,819 ops/sec** | **29.0x** |
+| **SET p50 Latency** | 26.815 ms | **0.479 ms** | **56.0x lower** |
+| **SET p99 Latency** | 57.119 ms | **1.591 ms** | **35.9x lower** |
+| **Memory Bandwidth** | ~43.5 GB/s (bus saturation) | < 120 MB/s | **Normal** |
+

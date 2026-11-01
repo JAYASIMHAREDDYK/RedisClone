@@ -10,12 +10,13 @@ Focused on high-performance systems programming, distributed storage engines, lo
 ## 📌 Featured Projects (Pinned)
 
 ### 1. [RedisClone](https://github.com/JAYASIMHAREDDYK/RedisClone)
-*High-Performance In-Memory Key-Value Store & Distributed Replication Engine in C++17*
+*High-Performance In-Memory Key-Value Store & Primary-Replica Replication Engine in C++17*
+- **Head-to-Head Benchmark vs Redis 7.0**: Measured **1.07M SET ops/sec** (53.3% of Redis 7.0) and **2.21M GET ops/sec** (94.9% of Redis 7.0) across 5 interleaved runs with $n = 1,000,000$ and $P = 16$; sustains **598k SET ops/sec** across a 1M random keyspace (`-r 1000000`).
 - **Reactor Network Architecture**: Single-threaded edge-triggered `epoll` reactor handling non-blocking TCP streams with zero mutex contention and pipelined batching.
 - **Progressive Dual-Table Rehashing**: Amortizes table expansion cost across queries ($O(1)$ per request), bounding max resize jitter to under 1.2 ms.
 - **SkipList Sorted Sets**: 32-level geometric SkipList with level spans for $O(\log N)$ rank lookups and range scans, backed by an auxiliary hash map for $O(1)$ member lookups.
-- **Async Primary-Replica Replication**: 1MB circular replication backlog with 64-bit continuous byte offsets, full snapshot synchronization (`PSYNC ? -1`), partial resynchronization (`+CONTINUE`), and `WAIT` semi-synchronous durability barriers.
-- **Failover Measurement**: Empirically measured acknowledged write loss under `SIGKILL` failover (53.3% loss under pure async replication vs. 0% with `WAIT`).
+- **Async Primary-Replica Replication**: Circular ring replication backlog with 64-bit continuous byte offsets, full snapshot synchronization (`PSYNC ? -1`), partial resynchronization (`+CONTINUE`), and `WAIT` semi-synchronous durability barriers.
+- **Failover Measurement**: Empirically measured acknowledged write loss under mid-stream `SIGKILL` failover: 53.3% write loss under pure async replication, reduced to 0% with `WAIT` when promoting the acknowledging replica.
 - **Security Hardening**: Hardened with LLVM `libFuzzer`, ASan, and UBSan across 1.25M+ executions, identifying and fixing 4 edge-case vulnerabilities.
 
 ### 2. [Sluice](https://github.com/JAYASIMHAREDDYK/Sluice)

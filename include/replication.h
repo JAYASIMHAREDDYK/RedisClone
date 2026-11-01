@@ -45,18 +45,21 @@ public:
     explicit ReplicationBacklog(size_t max_size = 1024 * 1024);
 
     void feed(const std::string& raw_resp);
+    void feed(const char* data, size_t len);
     bool can_partial_resync(const std::string& req_id, int64_t req_offset, const std::string& my_id) const;
     std::string get_data(int64_t from_offset) const;
 
     int64_t master_offset() const { return master_offset_; }
     int64_t start_offset() const { return start_offset_; }
-    size_t size() const { return buffer_.size(); }
+    size_t size() const { return stored_bytes_; }
 
     void set_master_offset(int64_t offset) { master_offset_ = offset; }
 
 private:
-    size_t max_size_;
-    std::string buffer_;
+    size_t max_size_{1024 * 1024};
+    std::vector<char> buffer_;
+    size_t write_idx_{0};
+    size_t stored_bytes_{0};
     int64_t master_offset_{0};
     int64_t start_offset_{0};
 };

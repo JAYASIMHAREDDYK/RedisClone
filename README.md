@@ -1,8 +1,6 @@
 # RedisClone
 
-> High-performance, single-threaded in-memory key-value store in C++17 implementing the RESP2 protocol, progressive dual-table rehashing, SkipList sorted sets, copy-on-write AOF persistence, and distributed asynchronous primary-replica streaming replication with offset backlog and partial resync.
-
-**GitHub Topics**: `redis`, `cpp17`, `reactor-pattern`, `epoll`, `in-memory-database`, `skiplist`, `distributed-systems`, `replication`, `resp2`, `fuzzing`, `systems-programming`
+> High-performance, single-threaded in-memory key-value store in C++17 implementing the RESP2 protocol, progressive dual-table rehashing, SkipList sorted sets, copy-on-write AOF persistence, and asynchronous primary-replica streaming replication with offset backlog and partial resync.
 
 [![CI](https://github.com/JAYASIMHAREDDYK/RedisClone/actions/workflows/ci.yml/badge.svg)](https://github.com/JAYASIMHAREDDYK/RedisClone/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -14,24 +12,32 @@
 
 ## Measured Engineering Highlights
 
-- **Measured Head-to-Head Benchmark**: Tested against official Redis 7.0 using identical flags (`redis-benchmark -c 50 -P 16 -n 1000000 -t set,get`), pinned to isolated cores with `taskset` across a 5-run median: achieves **83.8% of official Redis 7.0 throughput on pipelined GET** (1,908,397 vs 2,277,904 ops/sec). Raw stdout logs committed in `benchmark/results/`.
-- **Fuzzed RESP Parser (4 Bugs Found & Fixed)**: Hardened via LLVM `libFuzzer` + AddressSanitizer/UBSan across **1,255,730 executions** (~40,500 exec/sec), uncovering and resolving 4 vulnerabilities (OOM DoS via unbounded multi-bulk reserve, `size_t` integer overflow on bulk lengths, connection hang on blank inline commands, and null bulk frame handling). See [docs/fuzzing.md](docs/fuzzing.md).
-- **Quantified Failover Write Durability**: Empirically measured acknowledged write loss by killing the primary with `SIGKILL` mid-write and promoting the replica: **lost 5,327 of 10,000 acknowledged writes (53.3% loss)** under pure asynchronous replication, dropping to **0 of 300 writes lost (0.0% loss)** when guarded with the `WAIT` semi-synchronous replication barrier. See [benchmark/results/failover_durability.txt](benchmark/results/failover_durability.txt).
+- **Head-to-Head Benchmark vs Official Redis 7.0**: Tested across 5 interleaved runs using identical flags (`redis-benchmark -c 50 -P 16 -n 1000000 -t set,get`), pinned to isolated cores with `taskset` in WSL2 Debian 12 (both in-memory without AOF in the same session):
+  - **Standard Key Workload**:
+    - **Pipelined GET**: **2,212,390 ops/sec** (**94.9%** of official Redis 2,331,002 ops/sec; p50: 0.703 ms).
+    - **Pipelined SET**: **1,066,098 ops/sec** (**53.3%** of official Redis 2,000,000 ops/sec; p50: 1.039 ms, p99: 1.807 ms).
+  - **Random Keyspace Workload (`-r 1,000,000`)**:
+    - **Pipelined GET**: **823,723 ops/sec** (**65.9%** of official Redis 1,250,000 ops/sec; p50: 1.183 ms).
+    - **Pipelined SET**: **598,444 ops/sec** (**61.3%** of official Redis 976,562 ops/sec; p50: 1.959 ms).
+- **Fuzzed RESP Parser (4 Bugs Found & Fixed)**: Hardened via LLVM `libFuzzer` + AddressSanitizer/UBSan across **1,255,730 executions** (~40,500 exec/sec), uncovering and resolving 4 edge-case vulnerabilities (OOM DoS via unbounded multi-bulk array reservation, `size_t` integer overflow on bulk lengths, connection hang on blank inline commands, and null bulk frame handling). See [docs/fuzzing.md](docs/fuzzing.md).
+- **Quantified Failover Write Durability**: Empirically measured acknowledged write loss by killing the primary with `SIGKILL` mid-stream:
+  - **Pure Async Replication**: Lost **5,327 of 10,000 acknowledged writes (53.3% loss)**.
+  - **Semi-Synchronous `WAIT` Barrier**: Lost **0 of 300 acknowledged writes (0.0% loss)** *when promoting the acknowledging replica*, trading non-blocking write speed for synchronous barrier latency (~1.2 ms per batch). Note: `WAIT` ensures safety only if the acknowledged replica is the one promoted. See [benchmark/results/failover_durability.txt](benchmark/results/failover_durability.txt).
 
 ---
 
 ## Overview
 
-RedisClone is a standalone, single-threaded in-memory datastore engineered around an edge-triggered non-blocking event loop. It speaks standard RESP2 to remain compatible with existing Redis drivers and command-line utilities. Core storage relies on a dual-table progressive hash table to amortize rehashing costs across queries. Persistence is provided through an append-only file with periodic synchronization and copy-on-write background log rewriting. Distributed high availability is supported through asynchronous primary-replica streaming replication, 1MB replication backlog buffers, and partial resynchronization.
+RedisClone is a standalone, single-threaded in-memory datastore engineered around an edge-triggered non-blocking event loop. It speaks standard RESP2 to remain compatible with existing Redis drivers and command-line utilities. Core storage relies on a dual-table progressive hash table to amortize rehashing costs across queries. Persistence is provided through an append-only file with periodic synchronization and copy-on-write background log rewriting. High availability is supported through asynchronous primary-replica streaming replication, a circular ring replication backlog, and partial resynchronization (`+CONTINUE`).
 
-| Operation | Pipelined (P=16, c=50) | Unpipelined (P=1, c=50) | p50 Latency (Pipelined P=16 Only) | p99 Latency (Pipelined P=16 Only) |
-| :--- | :--- | :--- | :--- | :--- |
-| `SET` | 41,494 ops/sec | 38,200 ops/sec | 13.103 ms | 16.055 ms |
-| `GET` | 1,908,397 ops/sec | 74,711 ops/sec | 0.615 ms | 0.780 ms |
-| `ZADD` | 682,808 ops/sec | 73,786 ops/sec | 0.060 ms | 0.158 ms |
-| `PING` | 786,961 ops/sec | 76,246 ops/sec | 0.034 ms | 0.192 ms |
+| Workload Configuration | Operation | RedisClone (Ops/sec) | Official Redis 7.0 (Ops/sec) | % of Redis | p50 Latency (RedisClone) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Standard Key** | `SET` | 1,066,098 | 2,000,000 | **53.3%** | 1.039 ms |
+| **Standard Key** | `GET` | 2,212,390 | 2,331,002 | **94.9%** | 0.703 ms |
+| **Random Keyspace (`-r 1M`)** | `SET` | 598,444 | 976,562 | **61.3%** | 1.959 ms |
+| **Random Keyspace (`-r 1M`)** | `GET` | 823,723 | 1,250,000 | **65.9%** | 1.183 ms |
 
-*Note: Latencies sub-0.3 ms apply to pipelined requests (`P=16`) only. Unpipelined requests incur round-trip TCP network scheduling overhead. Benchmarks executed inside WSL2 Debian 12 (pinned with `taskset`); WSL2 virtualization introduces hypervisor scheduling noise compared to bare-metal Linux.*
+*Note: Benchmarks were executed inside WSL2 Debian 12 (pinned with `taskset`); WSL2 virtualization introduces scheduling noise compared to bare-metal Linux. All figures represent medians across 5 interleaved runs with $n = 1,000,000$, $P = 16$, $c = 50$, both operating in-memory (`--aof no` vs `--appendonly no --save ""`). Full stdout outputs archived in `benchmark/results/`.*
 
 ---
 
@@ -125,27 +131,12 @@ OK
 ### Async Primary-Replica Synchronization
 1. **Initial Full Synchronization**: The replica connects and issues `PSYNC ? -1`. The primary responds with `+FULLRESYNC <repl_id> <offset>`, transmits an in-memory snapshot of all active keys, and registers the replica as online.
 2. **Backlog Streaming & Partial Resync**: Mutations are buffered in a 1MB circular replication backlog. If a replica reconnects with a valid offset inside the backlog window, the primary returns `+CONTINUE` and streams only the delta.
-3. **Semi-Synchronous Replication (`WAIT`)**: Clients issuing `WAIT 1 <timeout_ms>` block until the replica confirms applying the primary's replication offset, reducing failover data loss to zero.
+3. **Semi-Synchronous Replication (`WAIT`)**: Clients issuing `WAIT 1 <timeout_ms>` block until the replica confirms applying the primary's replication offset, ensuring zero acknowledged write loss *when the acknowledging replica is promoted*.
 
 ### Persistence and Crash Recovery
 - `always`: Calls synchronous flush immediately on each write. Zero unacknowledged data loss, but throughput is bound by disk I/O.
 - `everysec` (Default): Writes append to the OS page cache per query; a dedicated background thread invokes `fdatasync()` once per second. In the event of an ungraceful crash (`SIGKILL`, power failure), up to 1 second of transactions can be lost.
 - `no`: Relies on kernel page buffer flushing heuristics.
-
----
-
-## Head-to-Head Benchmarks
-
-Raw benchmark logs from 5 consecutive runs with `redis-benchmark -c 50 -P 16 -n 1000000 -t set,get` (pinned to Core 2 via `taskset`, benchmark pinned to Cores 3,4):
-
-| Engine | SET Throughput (ops/sec) | SET p50 Latency | GET Throughput (ops/sec) | GET p50 Latency |
-| :--- | :--- | :--- | :--- | :--- |
-| **Official Redis 7.0** | 1,904,762 | 0.591 ms | 2,277,904 | 0.439 ms |
-| **RedisClone** | 41,494 | 26.815 ms | 1,908,397 | 0.615 ms |
-
-- **GET Performance**: RedisClone achieves **83.8% of official Redis 7.0 throughput** on pipelined GET operations with sub-millisecond p50 latency.
-- **SET Performance**: SET throughput reflects progressive rehash and eviction book-keeping overhead.
-- Raw run outputs are archived in [`benchmark/results/`](benchmark/results/). Full architecture and design details are documented in [`docs/design.md`](docs/design.md).
 
 ---
 
