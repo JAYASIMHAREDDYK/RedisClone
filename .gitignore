@@ -6,7 +6,9 @@
 *.log
 redis-server
 unit_tests
-fuzz_*
+/fuzz_*
+/fuzz_resp
+!tests/fuzz/**
 crash-*
 leak-*
 timeout-*
