@@ -9,6 +9,7 @@
 #include <cassert>
 #include <string>
 #include <vector>
+#include <random>
 
 using std::string;
 using std::vector;
@@ -304,6 +305,92 @@ void test_replication_backlog() {
     assert(read_after_wrap == expected_after_wrap);
 }
 
+void test_replication_backlog_model_check() {
+    // Randomized model check: Compare ReplicationBacklog against an ideal std::string model
+    const size_t cap = 64; // ring buffer size
+    redis::ReplicationBacklog backlog(cap);
+    string model;
+    string repl_id = "test_backlog_model_id_1234567890";
+
+    std::mt19937 rng(42); // deterministic seed for reproducibility
+    std::uniform_int_distribution<int> mode_dist(0, 7);
+
+    size_t byte_counter = 0;
+    const int NUM_ITERATIONS = 5000;
+
+    for (int iter = 0; iter < NUM_ITERATIONS; ++iter) {
+        size_t len = 0;
+        int mode = mode_dist(rng);
+        if (mode == 0) {
+            len = 1; // 1 byte
+        } else if (mode == 1) {
+            len = cap - 1; // boundary: max_size - 1
+        } else if (mode == 2) {
+            len = cap; // boundary: exactly max_size
+        } else if (mode == 3) {
+            len = cap + 1; // boundary: max_size + 1
+        } else if (mode == 4) {
+            len = cap * 2 - 1;
+        } else if (mode == 5) {
+            len = cap * 3 + 17; // oversize, non-multiple
+        } else if (mode == 6) {
+            len = std::uniform_int_distribution<size_t>(2, cap - 2)(rng);
+        } else {
+            len = std::uniform_int_distribution<size_t>(cap + 2, cap * 5)(rng);
+        }
+
+        string chunk;
+        chunk.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            chunk.push_back(static_cast<char>('!' + (byte_counter++ % 90)));
+        }
+
+        backlog.feed(chunk);
+        model.append(chunk);
+
+        int64_t expected_master_offset = static_cast<int64_t>(model.size());
+        size_t expected_stored = std::min(model.size(), cap);
+        int64_t expected_start_offset = expected_master_offset - static_cast<int64_t>(expected_stored);
+
+        assert(backlog.master_offset() == expected_master_offset);
+        assert(backlog.size() == expected_stored);
+        assert(backlog.start_offset() == expected_start_offset);
+
+        // Model Check Query 1: Exactly at start_offset
+        if (expected_stored > 0) {
+            assert(backlog.can_partial_resync(repl_id, expected_start_offset, repl_id) == true);
+            string full_window = backlog.get_data(expected_start_offset);
+            assert(full_window.size() == expected_stored);
+            assert(full_window == model.substr(expected_start_offset, expected_stored));
+        }
+
+        // Model Check Query 2: Exactly at master_offset (up-to-date replica, 0 bytes needed)
+        assert(backlog.can_partial_resync(repl_id, expected_master_offset, repl_id) == true);
+        assert(backlog.get_data(expected_master_offset) == "");
+
+        // Model Check Query 3: Outside window bounds (must reject)
+        if (expected_start_offset > 0) {
+            assert(backlog.can_partial_resync(repl_id, expected_start_offset - 1, repl_id) == false);
+            assert(backlog.get_data(expected_start_offset - 1) == "");
+        }
+        assert(backlog.can_partial_resync(repl_id, expected_master_offset + 1, repl_id) == false);
+        assert(backlog.get_data(expected_master_offset + 1) == "");
+
+        // Model Check Query 4: Random offsets within valid window
+        if (expected_stored > 0) {
+            std::uniform_int_distribution<int64_t> off_dist(expected_start_offset, expected_master_offset);
+            for (int q = 0; q < 3; ++q) {
+                int64_t query_off = off_dist(rng);
+                assert(backlog.can_partial_resync(repl_id, query_off, repl_id) == true);
+                string slice = backlog.get_data(query_off);
+                size_t expected_len = static_cast<size_t>(expected_master_offset - query_off);
+                assert(slice.size() == expected_len);
+                assert(slice == model.substr(query_off, expected_len));
+            }
+        }
+    }
+}
+
 int main() {
     test_common();
     cout << "[PASS] Common" << endl;
@@ -325,6 +412,9 @@ int main() {
 
     test_replication_backlog();
     cout << "[PASS] Replication Backlog Ring Buffer (wraparound, edge, outside, oversized)" << endl;
+
+    test_replication_backlog_model_check();
+    cout << "[PASS] Replication Backlog Randomized Model Check (5000 iterations vs std::string)" << endl;
 
     cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY!" << endl;
     return 0;

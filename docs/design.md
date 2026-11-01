@@ -160,9 +160,9 @@ When the replica is promoted via `REPLICAOF NO ONE`, those acknowledged writes a
 **Answer**:
 The `WAIT <numreplicas> <timeout_ms>` command introduces a semi-synchronous replication barrier. The client sends a write followed by `WAIT 1 1000`. The primary sends `REPLCONF GETACK *` to the replica and pauses returning to the client until the replica explicitly acknowledges having received and applied all byte offsets up to the write's replication offset.
 
-When testing failover with `WAIT 1 1000`, **0 of 300 acknowledged writes were lost (0.00% data loss)** when promoting the synchronized replica.
+When testing failover with `WAIT 1 1000` per batch of 100 writes across 10,000 acknowledged writes, **0 of 10,000 acknowledged writes were lost (0.00% data loss)** when promoting the synchronized replica.
 *Caveat*: `WAIT` guarantees zero acknowledged write loss **only if the acknowledging replica is the one promoted**. If an out-of-date or partitioned replica is elected, writes can still be lost.
-*Workload Difference*: The async test executed 10,000 writes to measure high-throughput async pipeline drainage under mid-stream `SIGKILL`. The `WAIT` test executed 300 writes because each batch incurred a synchronous round-trip acknowledgment barrier (~1.2 ms network RTT latency per batch), illustrating the classic latency-durability trade-off.
+*Throughput Cost*: Across 5 trials of 10,000 writes in batches of 100, Pure Async achieved **305,904 ops/sec** (0.33 ms batch latency) but lost **41.3% to 62.0% (median 61.7%, 6,170 of 10,000 writes)** on primary SIGKILL. Semi-sync with `WAIT 1` eliminated write loss (0 of 10,000 writes lost) but dropped throughput to **4,749 ops/sec** due to the 21.05 ms synchronous barrier latency per batch.
 
 ---
 
@@ -190,12 +190,12 @@ void ReplicationBacklog::feed(const std::string& raw_resp) {
     }
 }
 ```
-As soon as the backlog reached its 1MB capacity (`max_size_ = 1024 * 1024`), every single 50-byte `SET` command called `buffer_.erase(0, overflow)`. This caused an in-memory `memmove` of **1,048,576 bytes per query** on the reactor thread, saturating system memory bus bandwidth at ~43 GB/s.
+As soon as the backlog reached its 1MB capacity (`max_size_ = 1024 * 1024`), every single 50-byte `SET` command called `buffer_.erase(0, overflow)`. This caused an in-memory `memmove` of **1,048,576 bytes per query** on the reactor thread, bottlenecking the server on memory copying.
 
 Additionally, `Server::cmd_set` performed a redundant second hash lookup: calling `dict_.set(key, val)` followed immediately by `dict_.find(key)`, duplicating hash computation and bucket traversals.
 
 ### 4.4 Resolution
-1. **Circular Ring Buffer**: Refactored `ReplicationBacklog` to a preallocated `std::vector<char>` ring buffer indexed modulo `max_size_`. Appending new bytes is now strictly $O(\text{payload})$, writing into the buffer via 1 or 2 small `memcpy` operations with **zero `memmove` overhead**.
+1. **Circular Ring Buffer**: Refactored `ReplicationBacklog` to a preallocated `std::vector<char>` ring buffer indexed modulo `max_size_`. Appending new bytes is now strictly $O(\text{payload})$, writing into the buffer via 1 or 2 small `memcpy` operations without shifting historical backlog contents.
 2. **Single-Pass Hash & Insert**: Refactored `Dict::set(key, val, &out_entry)` to return the created or updated `Entry*` directly from the initial hash traversal, eliminating the redundant `dict_.find()` call.
 
 ### 4.5 Before vs. After Benchmark Comparison
@@ -203,10 +203,10 @@ Identical benchmark configuration (`redis-benchmark -c 50 -P 16 -n 1000000 -t se
 
 | Metric | Defective Backlog (`std::string::erase`) | Circular Ring Buffer + Single-Pass Dict | Speedup |
 | :--- | :---: | :---: | :---: |
-| **SET Throughput** | 41,494 ops/sec | **1,204,819 ops/sec** | **29.0x** |
+| **SET Throughput** | 41,494 ops/sec | **1,204,819 ops/sec** | **~30x** (29.0x) |
 | **SET p50 Latency** | 26.815 ms | **0.479 ms** | **56.0x lower** |
 | **SET p99 Latency** | 57.119 ms | **1.591 ms** | **35.9x lower** |
-| **Memory Bandwidth** | ~43.5 GB/s (bus saturation) | < 120 MB/s | **Normal** |
+| **Hotspot** | 95%+ in `__memmove_avx_unaligned_erms` | Protocol parse & hash insert | **Resolved** |
 
 ---
 

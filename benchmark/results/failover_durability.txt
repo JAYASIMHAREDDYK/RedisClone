@@ -1,13 +1,24 @@
 FAILOVER DURABILITY MEASUREMENT RESULTS
 =======================================
-Async Replication (No WAIT):
-  Acknowledged writes: 10000
-  Lost writes: 6193
-  Recovered writes: 3807
-  Loss percentage: 61.93%
+Configuration:
+  Total Acknowledged Writes: 10000
+  Batch Size: 100 pipelined writes per flush
+  Failure Injection: Immediate SIGKILL of primary under active load
+  Replication link latency simulation: --repl-delay-ms 10
 
-Semi-Sync Replication (WAIT 1):
+Pure Async Replication (No WAIT):
+  Run 1: Lost 6170 of 10000 writes (61.70%) | 342,899 ops/s | 0.29 ms/batch
+  Run 2: Lost 4127 of 10000 writes (41.27%) | 60,632 ops/s | 1.65 ms/batch
+  Run 3: Lost 6179 of 10000 writes (61.79%) | 314,454 ops/s | 0.32 ms/batch
+  Run 4: Lost 6051 of 10000 writes (60.51%) | 240,127 ops/s | 0.42 ms/batch
+  Run 5: Lost 6199 of 10000 writes (61.99%) | 305,904 ops/s | 0.33 ms/batch
+  Summary Range: 41.27% to 61.99% loss
+  Median Loss: 61.70% (6170 writes lost)
+  Median Throughput: 305,904 ops/sec (0.33 ms/batch)
+
+Semi-Sync Replication (WAIT 1 per batch of 100 writes):
   Acknowledged writes: 10000
   Lost writes: 0
   Recovered writes: 10000
   Loss percentage: 0.00%
+  Throughput: 4,749 ops/sec (21.05 ms/batch barrier cost)

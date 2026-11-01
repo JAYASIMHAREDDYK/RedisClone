@@ -1,0 +1,29 @@
+name: Nightly Fuzzing
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  libfuzzer-nightly:
+    name: libFuzzer + ASan/UBSan 10-Minute Run
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Clang & LLVM
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm
+
+    - name: Build Fuzzer Target
+      run: |
+        make fuzz
+
+    - name: Execute Fuzzing with Committed Corpus (10 Minutes)
+      run: |
+        # Run libFuzzer for 600 seconds (10 minutes) with ASan & UBSan enabled
+        ./fuzz_resp -max_total_time=600 -print_final_stats=1 tests/fuzz/corpus

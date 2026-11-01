@@ -78,4 +78,4 @@ jobs:
     - name: Build & Run libFuzzer Target (Smoke Test)
       run: |
         make fuzz
-        ./fuzz_resp -max_total_time=15
+        ./fuzz_resp -max_total_time=15 tests/fuzz/corpus
