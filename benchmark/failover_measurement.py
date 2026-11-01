@@ -36,7 +36,7 @@ def read_resp(f):
         return line_str.strip()
     return line_str.strip()
 
-def run_scenario(use_wait=False, total_ops=10000, port_master=6385, port_replica=6386):
+def run_scenario(use_wait=False, total_ops=10000, port_master=6385, port_replica=6386, delay_ms=0):
     for f in ["master.aof", "replica.aof", "temp-rewrite.aof"]:
         if os.path.exists(f):
             try:
@@ -45,7 +45,7 @@ def run_scenario(use_wait=False, total_ops=10000, port_master=6385, port_replica
                 pass
 
     master = subprocess.Popen(["./redis-server", "-p", str(port_master), "--aof", "no"])
-    replica = subprocess.Popen(["./redis-server", "-p", str(port_replica), "--aof", "no", "--repl-delay-ms", "10"])
+    replica = subprocess.Popen(["./redis-server", "-p", str(port_replica), "--aof", "no", "--repl-delay-ms", str(delay_ms)])
     time.sleep(0.5)
 
     try:
@@ -116,71 +116,100 @@ def run_scenario(use_wait=False, total_ops=10000, port_master=6385, port_replica
     return len(acknowledged), lost, recovered, throughput, batch_lat_ms
 
 def main():
-    print("=================================================================")
-    print("      FAILOVER DURABILITY MEASUREMENT: 5 TRIALS & THROUGHPUT      ")
-    print("=================================================================")
+    print("==========================================================================================")
+    print("      FAILOVER DURABILITY MATRIX: LOSS VS INJECTED REPLICA LAG (0ms, 1ms, 10ms)           ")
+    print("==========================================================================================")
 
     TOTAL_OPS = 10000
     TRIALS = 5
+    DELAYS = [0, 1, 10]
+    delay_labels = {
+        0: "0 ms (Localhost / Zero Added Lag)",
+        1: "1 ms (Low-Latency Datacenter LAN)",
+        10: "10 ms (Simulated WAN / Cross-Region)"
+    }
 
-    print(f"\n[1/2] Running Scenario A: Pure Async Replication (5 Trials of {TOTAL_OPS} writes)...")
-    async_results = []
-    for t in range(TRIALS):
-        ack, lost, rec, tp, lat = run_scenario(use_wait=False, total_ops=TOTAL_OPS)
-        loss_pct = (lost / ack * 100.0) if ack > 0 else 0.0
-        async_results.append((ack, lost, rec, loss_pct, tp, lat))
-        print(f"  Run {t+1}: Lost {lost}/{ack} writes ({loss_pct:.2f}%) | Throughput: {tp:,.0f} ops/s | Latency: {lat:.2f} ms/batch (100 writes)")
+    results_table = []
 
-    loss_pcts = [r[3] for r in async_results]
-    lost_counts = [r[1] for r in async_results]
-    tps_a = [r[4] for r in async_results]
-    lats_a = [r[5] for r in async_results]
+    for delay in DELAYS:
+        label = delay_labels[delay]
+        print(f"\n>>> Testing Scenario: Replica Delay = {delay} ms [{label}] <<<")
+        
+        # 5 trials of pure async
+        async_runs = []
+        for t in range(TRIALS):
+            ack, lost, rec, tp, lat = run_scenario(use_wait=False, total_ops=TOTAL_OPS, delay_ms=delay)
+            loss_pct = (lost / ack * 100.0) if ack > 0 else 0.0
+            async_runs.append((ack, lost, rec, loss_pct, tp, lat))
+            print(f"  [Async] Trial {t+1}: Lost {lost}/{ack} writes ({loss_pct:.2f}%) | {tp:,.0f} ops/s | {lat:.2f} ms/batch")
+        
+        loss_pcts = [r[3] for r in async_runs]
+        lost_counts = [r[1] for r in async_runs]
+        tps = [r[4] for r in async_runs]
+        lats = [r[5] for r in async_runs]
 
-    loss_pcts_sorted = sorted(loss_pcts)
-    median_loss_pct = loss_pcts_sorted[len(loss_pcts_sorted) // 2]
-    min_loss_pct = min(loss_pcts)
-    max_loss_pct = max(loss_pcts)
-    avg_lost_count = sum(lost_counts) / len(lost_counts)
-    median_tp_a = sorted(tps_a)[len(tps_a) // 2]
-    median_lat_a = sorted(lats_a)[len(lats_a) // 2]
+        min_loss = min(loss_pcts)
+        max_loss = max(loss_pcts)
+        med_loss = sorted(loss_pcts)[len(loss_pcts)//2]
+        med_lost_cnt = sorted(lost_counts)[len(lost_counts)//2]
+        med_tp_async = sorted(tps)[len(tps)//2]
+        med_lat_async = sorted(lats)[len(lats)//2]
 
-    print(f"\nAsync Replication Summary:")
-    print(f"  -> Loss Range: {min_loss_pct:.2f}% to {max_loss_pct:.2f}% (Median: {median_loss_pct:.2f}%, Avg lost: {avg_lost_count:.0f} of {TOTAL_OPS})")
-    print(f"  -> Median Throughput: {median_tp_a:,.0f} ops/s (Batch latency: {median_lat_a:.2f} ms per 100 writes)")
+        # 1 trial of WAIT 1 per batch of 100
+        print(f"  [WAIT 1] Running Semi-Sync Trial (10,000 writes in batches of 100)...")
+        ack_w, lost_w, rec_w, tp_w, lat_w = run_scenario(use_wait=True, total_ops=TOTAL_OPS, delay_ms=delay)
+        loss_pct_w = (lost_w / ack_w * 100.0) if ack_w > 0 else 0.0
+        print(f"  [WAIT 1] Lost {lost_w}/{ack_w} writes ({loss_pct_w:.2f}%) | {tp_w:,.0f} ops/s | {lat_w:.2f} ms/batch (includes WAIT barrier)")
 
-    print(f"\n[2/2] Running Scenario B: Semi-Sync Replication (WAIT 1 per batch of 100 writes)...")
-    ack_b, lost_b, rec_b, tp_b, lat_b = run_scenario(use_wait=True, total_ops=TOTAL_OPS)
-    loss_pct_b = (lost_b / ack_b * 100.0) if ack_b > 0 else 0.0
-    print(f"  -> Total Acknowledged Writes: {ack_b}")
-    print(f"  -> Lost Acknowledged Writes on SIGKILL: {lost_b} ({loss_pct_b:.2f}%)")
-    print(f"  -> Throughput: {tp_b:,.0f} ops/s | Batch Latency: {lat_b:.2f} ms per 100 writes (includes WAIT barrier)")
+        results_table.append({
+            "delay": delay,
+            "label": label,
+            "async_runs": async_runs,
+            "min_loss": min_loss,
+            "max_loss": max_loss,
+            "med_loss": med_loss,
+            "med_lost_cnt": med_lost_cnt,
+            "med_tp_async": med_tp_async,
+            "med_lat_async": med_lat_async,
+            "ack_w": ack_w,
+            "lost_w": lost_w,
+            "loss_pct_w": loss_pct_w,
+            "tp_w": tp_w,
+            "lat_w": lat_w
+        })
 
-    print("\n=================================================================")
-    print(f"SUMMARY RESULT:")
-    print(f"  Async Failover Data Loss: {min_loss_pct:.1f}% - {max_loss_pct:.1f}% (lost {sorted(lost_counts)[len(lost_counts)//2]} of {TOTAL_OPS} median) at {median_tp_a:,.0f} ops/sec")
-    print(f"  WAIT 1 Data Loss: {lost_b} of {ack_b} writes lost (0.00%) at {tp_b:,.0f} ops/sec ({lat_b:.2f} ms/batch)")
-    print("=================================================================")
+    print("\n==========================================================================================")
+    print("                             MEASURED SUMMARY TABLE")
+    print("==========================================================================================")
+    print(f"{'Replica Lag':<18} | {'Async Loss Range (5 runs)':<26} | {'Async QPS':<13} | {'WAIT Loss':<11} | {'WAIT QPS':<11} | {'WAIT Batch Latency':<18}")
+    print("-" * 110)
+    for r in results_table:
+        range_str = f"{r['min_loss']:.1f}% - {r['max_loss']:.1f}% (med {r['med_loss']:.1f}%)"
+        print(f"{r['delay']} ms lag          | {range_str:<26} | {r['med_tp_async']:<13,.0f} | {r['lost_w']} ({r['loss_pct_w']:.1f}%)   | {r['tp_w']:<11,.0f} | {r['lat_w']:.2f} ms")
+    print("==========================================================================================")
 
     os.makedirs("benchmark/results", exist_ok=True)
     with open("benchmark/results/failover_durability.txt", "w") as f:
-        f.write("FAILOVER DURABILITY MEASUREMENT RESULTS\n")
-        f.write("=======================================\n")
-        f.write("Configuration:\n")
-        f.write(f"  Total Acknowledged Writes: {TOTAL_OPS}\n")
-        f.write("  Batch Size: 100 pipelined writes per flush\n")
-        f.write("  Failure Injection: Immediate SIGKILL of primary under active load\n")
-        f.write("  Replication link latency simulation: --repl-delay-ms 10\n\n")
-        f.write("Pure Async Replication (No WAIT):\n")
-        for i, r in enumerate(async_results):
-            f.write(f"  Run {i+1}: Lost {r[1]} of {r[0]} writes ({r[3]:.2f}%) | {r[4]:,.0f} ops/s | {r[5]:.2f} ms/batch\n")
-        f.write(f"  Summary Range: {min_loss_pct:.2f}% to {max_loss_pct:.2f}% loss\n")
-        f.write(f"  Median Loss: {median_loss_pct:.2f}% ({sorted(lost_counts)[len(lost_counts)//2]} writes lost)\n")
-        f.write(f"  Median Throughput: {median_tp_a:,.0f} ops/sec ({median_lat_a:.2f} ms/batch)\n\n")
-        f.write("Semi-Sync Replication (WAIT 1 per batch of 100 writes):\n")
-        f.write(f"  Acknowledged writes: {ack_b}\n")
-        f.write(f"  Lost writes: {lost_b}\n")
-        f.write(f"  Recovered writes: {rec_b}\n")
-        f.write(f"  Loss percentage: {loss_pct_b:.2f}%\n")
-        f.write(f"  Throughput: {tp_b:,.0f} ops/sec ({lat_b:.2f} ms/batch barrier cost)\n")
+        f.write("FAILOVER DURABILITY MEASUREMENT RESULTS: LOSS VS REPLICA LAG\n")
+        f.write("============================================================\n")
+        f.write("Workload: 10,000 acknowledged writes (batches of 100 pipelined SETs)\n")
+        f.write("Failure Injection: Immediate SIGKILL of primary under active load\n")
+        f.write("Trials per delay setting: 5 runs of Pure Async, 1 run of WAIT 1 per batch\n\n")
+
+        f.write("| Replica Lag | Environment | Async Loss Range (5 runs) | Async Median Loss | Async Throughput | WAIT 1 Loss | WAIT 1 Throughput | WAIT Barrier Cost |\n")
+        f.write("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |\n")
+        for r in results_table:
+            f.write(f"| **{r['delay']} ms** | {r['label']} | **{r['min_loss']:.1f}% - {r['max_loss']:.1f}%** | {r['med_loss']:.1f}% ({r['med_lost_cnt']} writes) | {r['med_tp_async']:,.0f} ops/s | **{r['lost_w']} of {r['ack_w']} (0.0%)** | {r['tp_w']:,.0f} ops/s | {r['lat_w']:.2f} ms/batch |\n")
+
+        f.write("\n\nDetailed Trial Logs:\n")
+        f.write("====================\n")
+        for r in results_table:
+            f.write(f"\n--- Injected Delay: {r['delay']} ms ({r['label']}) ---\n")
+            f.write("Pure Async Trials:\n")
+            for i, run in enumerate(r["async_runs"]):
+                f.write(f"  Trial {i+1}: Lost {run[1]} of {run[0]} writes ({run[3]:.2f}%) | Throughput: {run[4]:,.0f} ops/sec | Batch Latency: {run[5]:.2f} ms\n")
+            f.write(f"WAIT 1 Trial:\n")
+            f.write(f"  Lost {r['lost_w']} of {r['ack_w']} writes ({r['loss_pct_w']:.2f}%) | Throughput: {r['tp_w']:,.0f} ops/sec | Batch Latency: {r['lat_w']:.2f} ms\n")
+
 if __name__ == "__main__":
     main()

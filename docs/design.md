@@ -162,7 +162,10 @@ The `WAIT <numreplicas> <timeout_ms>` command introduces a semi-synchronous repl
 
 When testing failover with `WAIT 1 1000` per batch of 100 writes across 10,000 acknowledged writes, **0 of 10,000 acknowledged writes were lost (0.00% data loss)** when promoting the synchronized replica.
 *Caveat*: `WAIT` guarantees zero acknowledged write loss **only if the acknowledging replica is the one promoted**. If an out-of-date or partitioned replica is elected, writes can still be lost.
-*Throughput Cost*: Across 5 trials of 10,000 writes in batches of 100, Pure Async achieved **305,904 ops/sec** (0.33 ms batch latency) but lost **41.3% to 62.0% (median 61.7%, 6,170 of 10,000 writes)** on primary SIGKILL. Semi-sync with `WAIT 1` eliminated write loss (0 of 10,000 writes lost) but dropped throughput to **4,749 ops/sec** due to the 21.05 ms synchronous barrier latency per batch.
+*Throughput & Replica Lag Matrix*: Across 5 trials per setting (10,000 writes in batches of 100):
+- **0 ms replica lag (Localhost)**: Pure Async lost **0.0% (0 of 10,000 writes)** because loopback TCP draining kept up with ingestion; `WAIT 1` ran at **100,978 ops/sec** (0.99 ms barrier latency).
+- **1 ms replica lag (Fast Datacenter LAN)**: Pure Async lost **0.0% (0 of 10,000 writes)**; `WAIT 1` ran at **39,436 ops/sec** (2.54 ms barrier latency).
+- **10 ms replica lag (Simulated WAN / Cross-Region)**: Pure Async lost **59.8% to 62.3% (median 61.0%, ~6,100 of 10,000 writes)** at 240,788 ops/sec because the in-flight replication stream was cut off mid-flight on SIGKILL. Semi-sync `WAIT 1` prevented write loss completely (0 of 10,000 lost), but dropped throughput to **4,576 ops/sec** due to the 21.85 ms barrier latency per batch. Full logs archived in [benchmark/results/failover_durability.txt](../benchmark/results/failover_durability.txt).
 
 ---
 
@@ -199,14 +202,16 @@ Additionally, `Server::cmd_set` performed a redundant second hash lookup: callin
 2. **Single-Pass Hash & Insert**: Refactored `Dict::set(key, val, &out_entry)` to return the created or updated `Entry*` directly from the initial hash traversal, eliminating the redundant `dict_.find()` call.
 
 ### 4.5 Before vs. After Benchmark Comparison
-Identical benchmark configuration (`redis-benchmark -c 50 -P 16 -n 1000000 -t set` without AOF):
+Benchmark configuration (`redis-benchmark -c 50 -P 16 -t set` without AOF):
 
 | Metric | Defective Backlog (`std::string::erase`) | Circular Ring Buffer + Single-Pass Dict | Speedup |
 | :--- | :---: | :---: | :---: |
-| **SET Throughput** | 41,494 ops/sec | **1,204,819 ops/sec** | **~30x** (29.0x) |
+| **SET Throughput** | 41,494 ops/sec | **1,204,819 ops/sec** | **~30x** |
 | **SET p50 Latency** | 26.815 ms | **0.479 ms** | **56.0x lower** |
 | **SET p99 Latency** | 57.119 ms | **1.591 ms** | **35.9x lower** |
 | **Hotspot** | 95%+ in `__memmove_avx_unaligned_erms` | Protocol parse & hash insert | **Resolved** |
+
+*Note: The defective build was measured at $n = 1,000,000$ (collapsing under 1MB per-write `memmove` overhead); the initial fixed ring buffer build reached 1,204,819 ops/sec at $n = 100,000$ (roughly a 30x recovery), before subsequent write-path optimizations (in-place string assignment and buffer reservation) raised single-key throughput to 2,493,766 ops/sec.*
 
 ---
 
