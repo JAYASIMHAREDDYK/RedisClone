@@ -15,9 +15,11 @@ void Expirer::set_expire(Entry* entry, uint64_t expire_at_ms) {
 }
 
 void Expirer::clear_expire(Entry* entry) {
-    if (!entry) return;
+    if (!entry || entry->expire_at_ms == 0) return;
     entry->expire_at_ms = 0;
-    expiring_keys_.erase(entry->key);
+    if (!expiring_keys_.empty()) {
+        expiring_keys_.erase(entry->key);
+    }
 }
 
 bool Expirer::is_expired(Entry* entry) const {
@@ -39,7 +41,9 @@ int64_t Expirer::ttl_sec(Entry* entry) const {
 }
 
 void Expirer::on_delete(const string& key) {
-    expiring_keys_.erase(key);
+    if (!expiring_keys_.empty()) {
+        expiring_keys_.erase(key);
+    }
 }
 
 int Expirer::sample_expired(Dict& dict, const DeleteCallback& on_delete, int max_ms) {

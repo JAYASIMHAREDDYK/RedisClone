@@ -55,6 +55,10 @@ Server::~Server() {
     stop();
 }
 
+size_t Server::estimate_size(const string& key, const string& val) {
+    return sizeof(Entry) + key.capacity() + val.capacity();
+}
+
 size_t Server::estimate_size(const string& key, const Value& value) {
     size_t sz = sizeof(Entry) + key.capacity();
     if (std::holds_alternative<string>(value)) {
@@ -73,7 +77,9 @@ bool Server::del_key(const string& key) {
     if (!entry) return false;
 
     size_t sz = estimate_size(entry->key, entry->value);
-    eviction_.on_remove(entry);
+    if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction) {
+        eviction_.on_remove(entry);
+    }
     expire_.clear_expire(entry);
 
     bool ok = dict_.erase(key);
@@ -169,6 +175,8 @@ void Server::stop() {
 }
 
 void Server::propagate_to_replicas(const vector<string>& args) {
+    if (!has_active_replication_ && replicas_.empty()) return;
+
     string payload = RespWriter::array(args);
     backlog_.feed(payload);
 
@@ -262,7 +270,8 @@ void Server::execute_internal(Client& client, const vector<string>& args, bool f
 
     // Propagate mutation to replicas if Master and not internal
     if (role_ == NodeRole::Master && client.fd != INVALID_SOCK && !from_master) {
-        if (cmd == "SET" || cmd == "DEL" || cmd == "EXPIRE" || cmd == "ZADD") {
+        if ((has_active_replication_ || !replicas_.empty()) &&
+            (cmd == "SET" || cmd == "DEL" || cmd == "EXPIRE" || cmd == "ZADD")) {
             propagate_to_replicas(args);
         }
     }
@@ -323,22 +332,29 @@ void Server::cmd_set(Client& client, const vector<string>& args) {
     Entry* entry = nullptr;
     bool is_new = dict_.set(key, val, &entry);
     if (entry) {
+        bool eviction_active = (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction);
         if (is_new) {
             stats_.used_memory_bytes += estimate_size(key, val);
-            eviction_.on_insert(entry);
+            if (eviction_active) {
+                eviction_.on_insert(entry);
+            }
         } else {
-            eviction_.on_touch(entry);
+            if (eviction_active) {
+                eviction_.on_touch(entry);
+            }
         }
 
         if (ex_seconds.has_value()) {
             uint64_t expire_at = unix_time_ms() + (*ex_seconds * 1000);
             expire_.set_expire(entry, expire_at);
-        } else {
+        } else if (entry->expire_at_ms != 0) {
             expire_.clear_expire(entry);
         }
     }
 
-    evict_if_needed();
+    if (config_.maxmemory > 0) {
+        evict_if_needed();
+    }
 
     if (config_.aof_enabled && client.fd != INVALID_SOCK) {
         aof_.append(args);
@@ -373,7 +389,9 @@ void Server::cmd_get(Client& client, const vector<string>& args) {
         return;
     }
 
-    eviction_.on_touch(entry);
+    if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction) {
+        eviction_.on_touch(entry);
+    }
     client.write(RespWriter::bulk(entry->str()));
 }
 
@@ -513,15 +531,20 @@ void Server::cmd_zadd(Client& client, const vector<string>& args) {
     shared_ptr<ZSet> zset;
     bool is_new = false;
 
+    bool eviction_active = (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction);
     if (!entry) {
         zset = make_shared<ZSet>();
         dict_.set(key, zset);
         entry = dict_.find(key);
-        eviction_.on_insert(entry);
+        if (eviction_active) {
+            eviction_.on_insert(entry);
+        }
         is_new = true;
     } else {
         zset = entry->zset();
-        eviction_.on_touch(entry);
+        if (eviction_active) {
+            eviction_.on_touch(entry);
+        }
     }
 
     int added = zset->add(*score, member);
@@ -578,7 +601,9 @@ void Server::cmd_zrange(Client& client, const vector<string>& args) {
         return;
     }
 
-    eviction_.on_touch(entry);
+    if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction) {
+        eviction_.on_touch(entry);
+    }
     auto zset = entry->zset();
     auto elements = zset->range(*start_opt, *stop_opt);
 
@@ -630,7 +655,9 @@ void Server::cmd_zrangebyscore(Client& client, const vector<string>& args) {
         return;
     }
 
-    eviction_.on_touch(entry);
+    if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction) {
+        eviction_.on_touch(entry);
+    }
     auto zset = entry->zset();
     auto elements = zset->range_by_score(*min_opt, *max_opt);
 
@@ -666,7 +693,9 @@ void Server::cmd_zscore(Client& client, const vector<string>& args) {
         return;
     }
 
-    eviction_.on_touch(entry);
+    if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction) {
+        eviction_.on_touch(entry);
+    }
     auto zset = entry->zset();
     auto score = zset->score_of(member);
 
@@ -698,7 +727,9 @@ void Server::cmd_zcard(Client& client, const vector<string>& args) {
         return;
     }
 
-    eviction_.on_touch(entry);
+    if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction) {
+        eviction_.on_touch(entry);
+    }
     auto zset = entry->zset();
     client.write(RespWriter::integer(static_cast<int64_t>(zset->size())));
 }
@@ -747,7 +778,7 @@ void Server::cmd_info(Client& client, const vector<string>& args) {
     ss << "master_replid:" << repl_id_ << "\r\n";
     ss << "master_repl_offset:" << backlog_.master_offset() << "\r\n";
     ss << "second_repl_offset:-1\r\n";
-    ss << "repl_backlog_active:1\r\n";
+    ss << "repl_backlog_active:" << ((has_active_replication_ || !replicas_.empty()) ? 1 : 0) << "\r\n";
     ss << "repl_backlog_size:" << backlog_.size() << "\r\n";
     ss << "repl_backlog_first_byte_offset:" << backlog_.start_offset() << "\r\n";
     ss << "repl_backlog_histlen:" << backlog_.size() << "\r\n";
@@ -773,6 +804,7 @@ void Server::cmd_replicaof(Client& client, const vector<string>& args) {
         stop_replication();
         server_mutex_.lock();
         role_ = NodeRole::Master;
+        has_active_replication_ = !replicas_.empty();
         client.write(RespWriter::ok());
         return;
     }
@@ -853,6 +885,8 @@ void Server::cmd_psync(Client& client, const vector<string>& args) {
         auto parsed = parse_int(args[2]);
         if (parsed) req_offset = *parsed;
     }
+
+    has_active_replication_ = true;
 
     if (backlog_.can_partial_resync(req_id, req_offset, repl_id_)) {
         // Partial Resync!

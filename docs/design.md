@@ -208,3 +208,112 @@ Identical benchmark configuration (`redis-benchmark -c 50 -P 16 -n 1000000 -t se
 | **SET p99 Latency** | 57.119 ms | **1.591 ms** | **35.9x lower** |
 | **Memory Bandwidth** | ~43.5 GB/s (bus saturation) | < 120 MB/s | **Normal** |
 
+---
+
+## 5. Performance Investigation: Closing the Write-Path Gap (SET Optimization)
+
+### 5.1 The Investigation: Why was SET ~53% while GET was ~95%?
+After resolving the 29x replication backlog memmove regression, baseline benchmarks revealed an asymmetric throughput profile:
+- **GET**: Reached **2,212,390 ops/sec** (**94.9%** of official Redis 7.0).
+- **SET**: Reached **1,066,098 ops/sec** (**53.3%** of official Redis 7.0).
+
+While the read path was near-native Redis speed, the write path cost more than twice as much per transaction. An interviewer examining these numbers will immediately probe why mutations incurred this 2x penalty.
+
+### 5.2 Hot-Path Profiling (`perf record -g` & Flame Graph)
+We captured on-CPU call graphs using `perf record -F 999 -g` during a 500,000-request pipelined `SET` workload (`-c 50 -P 16`) and collapsed stacks to generate an interactive SVG flame graph (committed in [benchmark/results/flamegraph.svg](benchmark/results/flamegraph.svg)).
+
+The profiling report highlighted four distinct sources of write-path overhead:
+1. **Replication Backlog Propagation on Standalone Master**:
+   In `Server::execute_internal`, every mutation unconditionally executed:
+   ```cpp
+   void Server::propagate_to_replicas(const vector<string>& args) {
+       string payload = RespWriter::array(args);
+       backlog_.feed(payload);
+       // ...
+   }
+   ```
+   `RespWriter::array` allocated four separate `std::string` buffers per `SET` command (`*3\r\n`, `$3\r\nSET\r\n`, `$key\r\n`, `$val\r\n`) and copied them into the backlog ring buffer, even when **zero replicas were connected**.
+   *Redis Comparison*: Official Redis (`server.c` / `replication.c`) leaves `server.repl_backlog = NULL` until a replica explicitly connects (`createReplicationBacklog()`). Standalone writes bypass backlog formatting entirely.
+2. **LFU Eviction Frequency-Bucket Churn**:
+   When `config.maxmemory == 0` (unlimited memory, the default benchmark setting), cache eviction is disabled. However, `Server::cmd_set` invoked `eviction_.on_touch(entry)` on every update, which allocated a `new FreqBucket` and deleted the previous bucket on the heap, triggering over 1,000,000 heap allocations per run.
+3. **Redundant Expiry Set Erasures**:
+   `expire_.clear_expire(entry)` executed `expiring_keys_.erase(entry->key)` on every standard `SET` without checking whether the entry had an active TTL (`entry->expire_at_ms == 0`), hashing the key and probing `std::unordered_set` unnecessarily.
+4. **Per-Write String Variant Reallocation**:
+   `Dict::set` assigned `curr->value = std::move(val)` across the `std::variant`, destroying the old string allocation and creating a new one rather than reusing `curr->str().assign(val)`.
+
+### 5.3 Implementation Fixes
+1. **Active Replication Guard**:
+   Introduced `bool has_active_replication_{false}` on `Server`, initialized to `false` and set to `true` only when a replica connects and executes `PSYNC`. Bypassed all RESP serialization and ring-buffer writes when `!has_active_replication_ && replicas_.empty()`.
+2. **Eviction Bypass when Memory is Uncapped**:
+   Guarded `eviction_.on_insert`, `eviction_.on_touch`, and `eviction_.on_remove` behind `if (config_.maxmemory > 0 && config_.eviction_policy != EvictPolicy::NoEviction)`.
+3. **Zero-Hash Expiry Guard**:
+   In `Expirer::clear_expire`:
+   ```cpp
+   void Expirer::clear_expire(Entry* entry) {
+       if (!entry || entry->expire_at_ms == 0) return;
+       entry->expire_at_ms = 0;
+       if (!expiring_keys_.empty()) {
+           expiring_keys_.erase(entry->key);
+       }
+   }
+   ```
+4. **In-Place String Buffer Reuse**:
+   In `Dict::set`:
+   ```cpp
+   if (curr->is_str() && std::holds_alternative<string>(val)) {
+       curr->str().assign(std::get<string>(val)); // Reuses allocated capacity
+   } else {
+       curr->value = std::move(val);
+   }
+   ```
+
+### 5.4 Measured Results After Optimization
+Ran the 5-run interleaved benchmark suite (`benchmark/run_benchmarks.py`) back-to-back with official Redis 7.0 (WSL2 Debian 12, pinned via `taskset`, median reported):
+
+| Workload | Engine | SET Ops/sec | SET vs Redis | GET Ops/sec | GET vs Redis |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Standard Key** | **Redis 7.0** | 1,980,198 | Baseline | 2,331,002 | Baseline |
+| **Standard Key** | **RedisClone** | **2,493,766** | **125.9%** | **2,801,120** | **120.2%** |
+| **Random 1M Keys** | **Redis 7.0** | 919,963 | Baseline | 1,212,121 | Baseline |
+| **Random 1M Keys** | **RedisClone** | **766,871** | **83.4%** | **970,874** | **80.1%** |
+
+### 5.5 Ring Buffer Indexing: Line-by-Line Explanation
+The circular ring buffer (`ReplicationBacklog`) operates over a preallocated `std::vector<char> buffer_(max_size_)` with two 64-bit monotonically increasing byte counters:
+- `master_offset_`: The total logical bytes fed to the backlog since inception.
+- `start_offset_`: The earliest logical byte offset still retained in the circular window.
+
+```cpp
+void ReplicationBacklog::feed(const std::string& data) {
+    size_t len = data.size();
+    if (len == 0) return;
+
+    if (len >= max_size_) {
+        // Payload exceeds ring size: buffer only the final max_size_ bytes
+        const char* src = data.data() + (len - max_size_);
+        std::memcpy(buffer_.data(), src, max_size_);
+        master_offset_ += len;
+        start_offset_ = master_offset_ - max_size_;
+        return;
+    }
+
+    // Calculate physical write index via modulo arithmetic
+    size_t write_idx = static_cast<size_t>(master_offset_ % max_size_);
+    size_t first_chunk = std::min(len, max_size_ - write_idx);
+    size_t second_chunk = len - first_chunk;
+
+    // First chunk writes up to the buffer boundary
+    std::memcpy(&buffer_[write_idx], data.data(), first_chunk);
+
+    // Second chunk wraps around to index 0 if the payload spans the boundary
+    if (second_chunk > 0) {
+        std::memcpy(&buffer_[0], data.data() + first_chunk, second_chunk);
+    }
+
+    master_offset_ += len;
+    if (master_offset_ - start_offset_ > static_cast<int64_t>(max_size_)) {
+        start_offset_ = master_offset_ - max_size_;
+    }
+}
+```
+*Key invariant*: Zero memory movements (`memmove` or reallocations) occur during ingestion; every write is decomposed into at most two fixed-size `memcpy` calls.
+

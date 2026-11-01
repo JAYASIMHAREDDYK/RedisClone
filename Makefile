@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Iinclude
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fno-omit-frame-pointer -Iinclude
 
 ifeq ($(OS),Windows_NT)
     LDFLAGS = -lws2_32

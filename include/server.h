@@ -79,6 +79,7 @@ private:
     std::string repl_id_;
     ReplicationBacklog backlog_;
     std::unordered_map<socket_t, ReplicaPeer> replicas_;
+    bool has_active_replication_{false};
 
     // Replica state
     std::string master_host_;
@@ -125,6 +126,7 @@ private:
     void stop_replication();
     void replica_sync_worker();
 
+    size_t estimate_size(const std::string& key, const std::string& val);
     size_t estimate_size(const std::string& key, const Value& value);
 };
 

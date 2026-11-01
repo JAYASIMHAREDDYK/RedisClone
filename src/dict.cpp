@@ -143,7 +143,11 @@ bool Dict::set(const string& key, Value val, Entry** out_entry) {
         Entry* curr = t.table[idx];
         while (curr) {
             if (curr->key == key) {
-                curr->value = std::move(val);
+                if (curr->is_str() && std::holds_alternative<string>(val)) {
+                    curr->str().assign(std::get<string>(val));
+                } else {
+                    curr->value = std::move(val);
+                }
                 curr->last_accessed_time = unix_time_sec();
                 if (curr->frequency < 0xFFFFFFFF) {
                     curr->frequency++;
