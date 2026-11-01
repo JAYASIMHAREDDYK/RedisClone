@@ -21,6 +21,7 @@ set(CORE_SOURCES
     src/expire.cpp
     src/aof.cpp
     src/net.cpp
+    src/replication.cpp
     src/server.cpp
 )
 

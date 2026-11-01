@@ -7,11 +7,15 @@
 #include "expire.h"
 #include "aof.h"
 #include "net.h"
+#include "replication.h"
 #include <string>
 #include <vector>
 #include <memory>
 #include <cstdint>
 #include <atomic>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
 namespace redis {
 
@@ -24,6 +28,9 @@ struct Config {
     std::string aof_filename{"appendonly.aof"};
     FsyncPolicy aof_fsync{FsyncPolicy::EverySec};
     uint32_t client_timeout{0};
+    std::string replicaof_host{""};
+    int replicaof_port{0};
+    int repl_delay_ms{0};
 };
 
 struct Stats {
@@ -45,16 +52,21 @@ public:
     void stop();
 
     void execute(Client& client, const std::vector<std::string>& args);
+    void execute_internal(Client& client, const std::vector<std::string>& args, bool from_master);
 
     size_t memory_used() const { return stats_.used_memory_bytes.load(); }
     size_t key_count() const { return dict_.size(); }
 
     Dict& dict() { return dict_; }
+    NodeRole role() const { return role_; }
+
+    std::string dump_snapshot();
 
 private:
     Config config_;
     Stats stats_;
     bool running_{false};
+    std::mutex server_mutex_;
 
     Dict dict_;
     Evictor eviction_;
@@ -62,11 +74,29 @@ private:
     Aof aof_;
     EventLoop loop_;
 
+    // Replication Subsystem
+    NodeRole role_{NodeRole::Master};
+    std::string repl_id_;
+    ReplicationBacklog backlog_;
+    std::unordered_map<socket_t, ReplicaPeer> replicas_;
+
+    // Replica state
+    std::string master_host_;
+    int master_port_{0};
+    std::atomic<bool> stop_replica_thread_{false};
+    std::atomic<socket_t> replica_sock_{INVALID_SOCK_REPL};
+    std::thread replica_thread_;
+    std::string cached_master_repl_id_;
+    int64_t replica_applied_offset_{0};
+    std::atomic<uint64_t> last_master_io_time_{0};
+
     void setup_handlers();
     void cron();
 
     void evict_if_needed();
     bool del_key(const std::string& key);
+
+    void propagate_to_replicas(const std::vector<std::string>& args);
 
     void cmd_ping(Client& client, const std::vector<std::string>& args);
     void cmd_echo(Client& client, const std::vector<std::string>& args);
@@ -84,6 +114,16 @@ private:
     void cmd_bgrewriteaof(Client& client, const std::vector<std::string>& args);
     void cmd_info(Client& client, const std::vector<std::string>& args);
     void cmd_command(Client& client, const std::vector<std::string>& args);
+
+    // Replication Commands
+    void cmd_replicaof(Client& client, const std::vector<std::string>& args);
+    void cmd_wait(Client& client, const std::vector<std::string>& args);
+    void cmd_psync(Client& client, const std::vector<std::string>& args);
+    void cmd_replconf(Client& client, const std::vector<std::string>& args);
+
+    void start_replication(const std::string& host, int port);
+    void stop_replication();
+    void replica_sync_worker();
 
     size_t estimate_size(const std::string& key, const Value& value);
 };

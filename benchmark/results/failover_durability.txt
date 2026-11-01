@@ -1,0 +1,13 @@
+FAILOVER DURABILITY MEASUREMENT RESULTS
+=======================================
+Async Replication (No WAIT):
+  Acknowledged writes: 10000
+  Lost writes: 5327
+  Recovered writes: 4673
+  Loss percentage: 53.27%
+
+Semi-Sync Replication (WAIT 1):
+  Acknowledged writes: 300
+  Lost writes: 0
+  Recovered writes: 300
+  Loss percentage: 0.00%

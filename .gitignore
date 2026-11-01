@@ -4,5 +4,11 @@
 *.aof
 *.aof.temp
 *.log
+redis-server
+unit_tests
+fuzz_*
+crash-*
+leak-*
+timeout-*
 build/
 .vs/

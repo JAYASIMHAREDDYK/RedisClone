@@ -85,9 +85,11 @@ void Dict::expand_if_needed() {
 void Dict::step_rehash(int n) {
     if (!is_rehashing()) return;
 
-    while (n-- && ht[0].used != 0) {
+    int empty_visits = n * 10;
+    while (n > 0 && ht[0].used != 0) {
         while (rehashidx < static_cast<int64_t>(ht[0].size) && ht[0].table[rehashidx] == nullptr) {
             rehashidx++;
+            if (--empty_visits <= 0) return;
         }
 
         if (rehashidx >= static_cast<int64_t>(ht[0].size)) {
@@ -106,6 +108,7 @@ void Dict::step_rehash(int n) {
         }
         ht[0].table[rehashidx] = nullptr;
         rehashidx++;
+        n--;
     }
 
     if (ht[0].used == 0) {

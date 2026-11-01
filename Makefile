@@ -19,6 +19,7 @@ SRCS = src/common.cpp \
        src/expire.cpp \
        src/aof.cpp \
        src/net.cpp \
+       src/replication.cpp \
        src/server.cpp
 
 OBJS = $(SRCS:.cpp=.o)
@@ -35,6 +36,9 @@ $(TEST_TARGET): $(OBJS) tests/test_unit.o
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) src/main.o tests/test_unit.o $(TARGET) $(TEST_TARGET)
+	rm -f $(OBJS) src/main.o tests/test_unit.o $(TARGET) $(TEST_TARGET) fuzz_resp
 
-.PHONY: all clean
+fuzz:
+	clang++ -std=c++17 -fsanitize=fuzzer,address,undefined -O1 -g -Iinclude tests/fuzz/fuzz_resp.cpp src/resp.cpp -o fuzz_resp
+
+.PHONY: all clean fuzz

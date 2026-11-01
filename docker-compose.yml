@@ -1,0 +1,14 @@
+services:
+  redis-clone:
+    build: .
+    container_name: redis-clone
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    working_dir: /data
+    command: ["-p", "6379", "--aof", "yes", "--fsync", "everysec"]
+    restart: unless-stopped
+
+volumes:
+  redis_data:

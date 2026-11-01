@@ -257,11 +257,11 @@ void EventLoop::prune_idle() {
 }
 
 #ifndef _WIN32
-void EventLoop::poll_events() {
+void EventLoop::poll_events(int timeout_ms) {
     constexpr int MAX_EVENTS = 1024;
     epoll_event events[MAX_EVENTS];
 
-    int num_events = epoll_wait(epoll_fd_, events, MAX_EVENTS, 50);
+    int num_events = epoll_wait(epoll_fd_, events, MAX_EVENTS, timeout_ms);
     for (int i = 0; i < num_events; ++i) {
         int fd = events[i].data.fd;
         uint32_t ev = events[i].events;
@@ -289,7 +289,7 @@ void EventLoop::poll_events() {
     }
 }
 #else
-void EventLoop::poll_events() {
+void EventLoop::poll_events(int timeout_ms) {
     vector<WSAPOLLFD> fds;
     fds.reserve(clients_.size() + 1);
 
@@ -305,7 +305,7 @@ void EventLoop::poll_events() {
         fds.push_back(pfd);
     }
 
-    int ret = WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), 50);
+    int ret = WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), timeout_ms);
     if (ret <= 0) return;
 
     if (fds[0].revents & POLLIN) {

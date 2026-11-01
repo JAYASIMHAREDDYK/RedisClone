@@ -52,6 +52,17 @@ int main(int argc, char* argv[]) {
             if (fs == "always") config.aof_fsync = redis::FsyncPolicy::Always;
             else if (fs == "everysec") config.aof_fsync = redis::FsyncPolicy::EverySec;
             else if (fs == "no") config.aof_fsync = redis::FsyncPolicy::No;
+        } else if (arg == "--replicaof" && i + 2 < argc) {
+            config.replicaof_host = argv[++i];
+            auto port = redis::parse_int(argv[++i]);
+            if (port && *port > 0 && *port <= 65535) {
+                config.replicaof_port = static_cast<int>(*port);
+            }
+        } else if (arg == "--repl-delay-ms" && i + 1 < argc) {
+            auto ms = redis::parse_int(argv[++i]);
+            if (ms && *ms >= 0) {
+                config.repl_delay_ms = static_cast<int>(*ms);
+            }
         }
     }
 

@@ -64,6 +64,7 @@ public:
 
     size_t client_count() const { return clients_.size(); }
     void close(socket_t fd);
+    void poll_events(int timeout_ms = 50);
 
 private:
     std::string bind_ip_;
@@ -80,9 +81,6 @@ private:
 #ifndef _WIN32
     int epoll_fd_{-1};
     void update_epoll(socket_t fd, uint32_t events, int op);
-    void poll_events();
-#else
-    void poll_events();
 #endif
 
     bool set_nonblocking(socket_t fd);

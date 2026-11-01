@@ -8,19 +8,22 @@ on:
 
 jobs:
   build-and-test:
+    name: Build & Test (Strict Warnings)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
     - name: Set up C++ Build Tools
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake python3
 
-    - name: Build Targets
+    - name: Build with Strict Warnings
       run: |
-        make CXXFLAGS="-std=c++17 -Wall -Wextra -O2 -Iinclude"
+        make clean
+        make -j$(nproc) CXXFLAGS="-std=c++17 -Wall -Wextra -O2 -Iinclude"
 
     - name: Run Unit Tests
       run: |
@@ -37,3 +40,38 @@ jobs:
     - name: Run Stress Tests
       run: |
         python3 tests/test_stress.py
+
+    - name: Run Async Replication Tests
+      run: |
+        python3 tests/test_replication.py
+
+  sanitizer-and-fuzz:
+    name: ASan / UBSan & libFuzzer Run
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Clang & LLVM
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm python3
+
+    - name: Build with AddressSanitizer and UndefinedBehaviorSanitizer
+      run: |
+        make clean
+        make -j$(nproc) CXX=clang++ CXXFLAGS="-std=c++17 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -Iinclude"
+
+    - name: Run Sanitized Unit Tests
+      run: |
+        ./unit_tests
+
+    - name: Run Sanitized Integration Tests
+      run: |
+        python3 tests/test_integration.py
+
+    - name: Build & Run libFuzzer Target (Smoke Test)
+      run: |
+        make fuzz
+        ./fuzz_resp -max_total_time=15

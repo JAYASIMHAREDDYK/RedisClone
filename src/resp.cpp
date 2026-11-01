@@ -99,20 +99,29 @@ void RespParser::feed(string_view s) {
 
 bool RespParser::next_command(vector<string>& args) {
     args.clear();
-    if (buffer_.empty()) return false;
+    while (!buffer_.empty()) {
+        size_t consumed = 0;
+        bool ok = false;
 
-    size_t consumed = 0;
-    bool ok = false;
-
-    if (buffer_[0] == '*') {
-        ok = parse_array(args, consumed);
-    } else {
-        ok = parse_inline(args, consumed);
-    }
-
-    if (ok && consumed > 0) {
-        buffer_.erase(0, consumed);
-        return true;
+        if (buffer_[0] == '*') {
+            ok = parse_array(args, consumed);
+            if (ok && consumed > 0) {
+                buffer_.erase(0, consumed);
+                return true;
+            }
+            return false;
+        } else {
+            ok = parse_inline(args, consumed);
+            if (consumed > 0) {
+                buffer_.erase(0, consumed);
+                if (ok && !args.empty()) {
+                    return true;
+                }
+                // Blank or whitespace-only line consumed, continue loop
+                continue;
+            }
+            return false;
+        }
     }
 
     return false;
@@ -127,13 +136,13 @@ bool RespParser::parse_array(vector<string>& args, size_t& consumed) {
 
     int64_t count = 0;
     auto [p, ec] = std::from_chars(buffer_.data() + 1, buffer_.data() + crlf, count);
-    if (ec != std::errc() || count < 0) {
+    if (ec != std::errc() || p != buffer_.data() + crlf || count < 0 || count > 1024 * 1024) {
         return false;
     }
 
     size_t cur = crlf + 2;
     vector<string> parsed;
-    parsed.reserve(count);
+    parsed.reserve(std::min<size_t>(static_cast<size_t>(count), 1024));
 
     for (int64_t i = 0; i < count; ++i) {
         if (cur >= buffer_.size() || buffer_[cur] != '$') {
@@ -147,12 +156,22 @@ bool RespParser::parse_array(vector<string>& args, size_t& consumed) {
 
         int64_t bulk_len = 0;
         auto [bp, bec] = std::from_chars(buffer_.data() + cur + 1, buffer_.data() + next_crlf, bulk_len);
-        if (bec != std::errc() || bulk_len < 0) {
+        if (bec == std::errc() && bp == buffer_.data() + next_crlf && bulk_len == -1) {
+            parsed.emplace_back("");
+            cur = next_crlf + 2;
+            continue;
+        }
+
+        constexpr int64_t MAX_BULK_LEN = 512 * 1024 * 1024;
+        if (bec != std::errc() || bp != buffer_.data() + next_crlf || bulk_len < 0 || bulk_len > MAX_BULK_LEN) {
             return false;
         }
 
         size_t data_start = next_crlf + 2;
-        size_t data_end = data_start + bulk_len;
+        if (static_cast<uint64_t>(bulk_len) > (SIZE_MAX - data_start - 2)) {
+            return false;
+        }
+        size_t data_end = data_start + static_cast<size_t>(bulk_len);
 
         if (data_end + 2 > buffer_.size() || buffer_[data_end] != '\r' || buffer_[data_end + 1] != '\n') {
             return false;
